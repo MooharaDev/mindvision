@@ -256,7 +256,7 @@ function renderScan() {
     '</header>' +
     '<div class="body"><dl class="readout">' +
       readout("PDFs", atLeast(s.n_pdfs)) +
-      readout("Records", atLeast(s.units[recordUnit].n_records), "recordcount") +
+      readout("Records", atLeast(unitRecords(s, recordUnit)), "recordcount") +
       readout("Images", atLeast(s.n_images)) +
       readout("Folder depth", fmtNum(s.depth)) +
       readout("Size", fmtBytes(s.n_bytes) + (s.truncated ? "+" : "")) +
@@ -561,7 +561,20 @@ onAct("drop-field", (_d, node) => node.closest(".fieldrow").remove());
 
 function fillBuilder(s) {
   el("s-table").value = s.table || "records";
-  if (el("s-unit").options.length) el("s-unit").value = s.record_unit || recordUnit;
+  if (el("s-unit").options.length) {
+    // a saved schema may carry a grouping the picker does not list (e.g. a
+    // custom regex from another archive) — add it rather than silently
+    // building with whatever the select happened to show
+    const want = s.record_unit || recordUnit;
+    if (want && ![...el("s-unit").options].some(o => o.value === want)) {
+      const o = document.createElement("option");
+      o.value = want;
+      o.textContent = unitLabel(want);
+      el("s-unit").appendChild(o);
+    }
+    el("s-unit").value = want;
+    unitChanged();
+  }
   el("s-desc").value = s.task_description || "";
   el("s-fields").innerHTML = "";
   for (const f of (s.fields || [])) {
@@ -671,7 +684,10 @@ async function startBuild() {
     el("build-msg").textContent = "Add at least one field.";
     return;
   }
-  if (!(await validateSchema(false))) return;
+  if (!(await validateSchema(false))) {
+    el("build-msg").textContent = "The schema needs fixing — see above.";
+    return;
+  }
 
   const fd = new FormData();
   fd.append("staging_id", staging.staging_id);

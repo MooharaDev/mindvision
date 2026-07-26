@@ -61,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pdf2db  # noqa: E402  (the pipeline engine, same directory)
 
 APP_NAME = "Corpus"
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PDF2DB_WEB_DATA") or (Path.cwd() / "webapp_data"))
 JOBS_DIR = DATA_DIR / "jobs"

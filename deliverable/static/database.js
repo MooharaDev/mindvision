@@ -479,6 +479,16 @@ async function renderExport() {
 /* ======================= RECORD DRAWER + REVIEW ======================= */
 let reviewList = [], reviewIdx = -1;
 
+/* SQLite stores schema booleans as 0/1, the CSVs as True/False. Normalize to
+   one word or the edit select cannot show the stored value — and "Save
+   corrections" would see every boolean as changed and silently clear it. */
+function boolWord(v) {
+  const s = String(v).trim().toLowerCase();
+  if (s === "1" || s === "true") return "True";
+  if (s === "0" || s === "false") return "False";
+  return "";
+}
+
 onAct("open-row", d => {
   const t = tableData;
   if (!t) return;
@@ -495,10 +505,13 @@ function openImageDrawer(t, row) {
   const cell = c => { const i = t.columns.indexOf(c); return i >= 0 ? row[i] : ""; };
   const file = cell("file");           // embedded: exported under out/images/
   const origin = cell("origin");       // loose: still in the source archive
+  // per-segment encoding: encodeURI leaves "#" and "?" alone, which truncates
+  // the path for any archive filename that contains them
+  const encPath = p => String(p).split("/").map(encodeURIComponent).join("/");
   const src = file
-    ? "/api/jobs/" + encodeURIComponent(cid) + "/image/" + encodeURI(file)
+    ? "/api/jobs/" + encodeURIComponent(cid) + "/image/" + encPath(file)
     : (origin ? "/api/jobs/" + encodeURIComponent(cid) + "/source-image/" +
-                encodeURI(origin) : "");
+                encPath(origin) : "");
   const head = src
     ? '<img class="imgprev" alt="' + esc(origin || file) + '" src="' + src + '">'
     : "";
@@ -555,7 +568,8 @@ async function openRecord(recordId, forceEdit) {
       "</span>" : "") + "</div></div>";
 
   body += '<dl class="dl">' + fields.map(f => {
-    const v = val[f.name] === undefined ? "" : val[f.name];
+    let v = val[f.name] === undefined ? "" : val[f.name];
+    if (f.type === "boolean") v = boolWord(v) || v;
     const q = evidence[f.name];
     let input;
     if (!edit) {
@@ -621,7 +635,11 @@ async function openRecord(recordId, forceEdit) {
   }
 
   window._recordBase = {};
-  for (const f of fields) window._recordBase[f.name] = String(val[f.name] ?? "");
+  for (const f of fields) {
+    let b = String(val[f.name] ?? "");
+    if (f.type === "boolean") b = boolWord(b) || b;
+    window._recordBase[f.name] = b;
+  }
   openDrawerHTML(recordId, body, foot, nav);
 }
 
