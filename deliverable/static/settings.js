@@ -1,17 +1,26 @@
-/* Corpus — settings: the extraction endpoint, model and stored API key. */
+/* Corpus — settings: OCR defaults and a read-only view of the extraction
+   endpoint. The endpoint, model and API key are configured ONLY in
+   webapp_data/settings.json on the server (owner-only file, read on every
+   request) — deliberately not editable, or even fully visible, from here. */
 "use strict";
 
 async function enterSettings() {
   const s = await refreshSettings();
   if (!s) {
-    el("set-msg").innerHTML = callout("bad", "Could not load settings.");
+    el("endpoint-body").innerHTML = callout("bad", "Could not load settings.");
     return;
   }
-  el("set-url").value = s.llm_base_url;
-  el("set-model").value = s.llm_model;
-  el("set-key").value = "";
-  paintKeyHint(s);
-  el("set-msg").innerHTML = "";
+  el("endpoint-body").innerHTML =
+    (s.is_mock
+      ? callout("warn", "<strong>Test mode (mock) is active.</strong> Runs " +
+          "produce fake placeholder values and no network call is made.")
+      : callout("good", "Live endpoint — extracting with <b>" +
+          esc(s.llm_model) + "</b>.")) +
+    '<p class="hint" style="margin-top:var(--s3)">The endpoint URL, model ' +
+    "name and API key live in <code>webapp_data/settings.json</code> on this " +
+    "server — an owner-only file the operator edits directly. It is read on " +
+    "every request, so a change takes effect without a restart and the key " +
+    "is never shown in, or accepted from, this page.</p>";
   paintOcr(s);
 
   let health = {};
@@ -24,6 +33,8 @@ async function enterSettings() {
     row("Extraction mode", s.is_mock
       ? "mock — offline test values, no network call"
       : "live endpoint · " + esc(s.llm_model)) +
+    row("Endpoint config", "<code>webapp_data/settings.json</code> on this " +
+        "server — owner-only, never exposed through the API") +
     row("Network", "self-contained — the browser loads nothing from outside " +
         "this server") +
     row("Engine", "<code>pdf2db.py</code> — the same pipeline also runs headless " +
@@ -66,62 +77,5 @@ async function saveOcr() {
         : "Saved. New corpora default to <b>" + esc(s.ocr_mode) + "</b> OCR.");
   } catch (e) {
     el("set-ocr-msg").innerHTML = callout("bad", esc(e.message));
-  }
-}
-
-function paintKeyHint(s) {
-  el("set-keyhint").textContent = s.has_key
-    ? "— a key is stored (" + s.key_hint + ")" : "— none stored";
-}
-
-async function saveSettings() {
-  const body = { llm_base_url: el("set-url").value,
-                 llm_model: el("set-model").value };
-  if (el("set-key").value) body.llm_api_key = el("set-key").value;
-  try {
-    const s = await api("/api/settings", { method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body) });
-    settingsCache = s;
-    paintEndpoint();
-    el("set-key").value = "";
-    paintKeyHint(s);
-    el("set-msg").innerHTML = callout("good", "Saved. Every new run uses this" +
-      (s.is_mock ? " — note that <b>mock test mode</b> is still active." : "."));
-  } catch (e) {
-    el("set-msg").innerHTML = callout("bad", esc(e.message));
-  }
-}
-
-async function clearKey() {
-  if (!confirm("Remove the stored API key?")) return;
-  try {
-    const s = await api("/api/settings", { method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ llm_api_key: "" }) });
-    settingsCache = s;
-    paintKeyHint(s);
-    toast("Stored key removed");
-  } catch (e) { toast(e.message); }
-}
-
-async function testSettings() {
-  el("set-msg").innerHTML = '<p class="hint">Testing the endpoint…</p>';
-  const body = { llm_base_url: el("set-url").value };
-  if (el("set-key").value) body.llm_api_key = el("set-key").value;
-  try {
-    const r = await api("/api/settings/test", { method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body) });
-    const models = r.models || [];
-    const note = models.length
-      ? '<br><span class="hint">models include ' +
-        esc(models.slice(0, 6).join(", ")) + (models.length > 6 ? ", …" : "") +
-        "</span>" : "";
-    el("set-msg").innerHTML = r.ok
-      ? callout("good", esc(r.detail) + note)
-      : callout("bad", "<strong>Connection failed.</strong> " + esc(r.detail));
-  } catch (e) {
-    el("set-msg").innerHTML = callout("bad", esc(e.message));
   }
 }

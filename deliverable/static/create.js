@@ -453,9 +453,9 @@ function autoDraft() {
     draftState = "skipped";
     el("draft-panel").innerHTML = callout("warn",
         "<strong>Test mode is active</strong>, so the schema cannot be drafted " +
-        "from your documents — the mock backend never reads them. Set a real " +
-        'endpoint in <a href="#/settings">Settings</a>, or build the schema by ' +
-        "hand below.") +
+        "from your documents — the mock backend never reads them. The real " +
+        "endpoint is configured on the server (<code>webapp_data/settings.json" +
+        "</code>), or build the schema by hand below.") +
       '<div class="btnrow" style="margin-bottom:var(--s5)">' +
       '<button class="btn" data-act="load-example">Load the example schema' +
       "</button></div>";

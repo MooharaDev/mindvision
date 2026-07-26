@@ -26,7 +26,6 @@
  <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 14.2A8.5 8.5 0 019.8 4 8.5 8.5 0 1020 14.2z"/></symbol>
  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5.5L7.5 12l6.5 6.5"/></symbol>
  <symbol id="i-fwd" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5.5l6.5 6.5-6.5 6.5"/></symbol>
- <symbol id="i-key" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="14.5" r="4.5"/><path d="M11.8 11.2L20 3m-3.5 3.5L19 9"/></symbol>
  <symbol id="i-draft" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.8L19 9.6l-5.1 1.8L12 16l-1.9-4.6L5 9.6l5.1-1.8z"/><path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></symbol>
  <symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19.5 8.5a2.1 2.1 0 00-3-3L5 17z"/></symbol>
  <symbol id="i-doc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M6 3h8l4.5 4.5V21H6z"/><path d="M14 3v5h4.5"/></symbol>
@@ -277,34 +276,8 @@
   <div class="content narrow">
     <div class="panel">
       <header><div><h2>Extraction model</h2>
-        <p class="sub">An OpenAI-compatible endpoint on your network.</p></div></header>
-      <div class="body">
-        <div class="grid2">
-          <div class="field"><label for="set-url">Base URL</label>
-            <input type="text" id="set-url" spellcheck="false"
-                   placeholder="gateway.internal/v1">
-            <p class="hint">The full base URL of the OpenAI-compatible gateway,
-              scheme included, ending in <code>/v1</code>. Use <code>mock</code>
-              for offline test mode.</p></div>
-          <div class="field"><label for="set-model">Model name</label>
-            <input type="text" id="set-model" spellcheck="false"></div>
-        </div>
-        <div class="field"><label for="set-key">API key <span class="hint"
-              id="set-keyhint"></span></label>
-          <input type="password" id="set-key" autocomplete="off"
-                 placeholder="leave blank to keep the stored key">
-          <p class="hint">Stored server-side in <code>settings.json</code> with
-            owner-only permissions. Never shown again in full, never written to
-            logs or run summaries.</p></div>
-        <div class="btnrow">
-          <button class="btn primary" onclick="saveSettings()">
-            <svg width="14" height="14"><use href="#i-save"/></svg>Save settings</button>
-          <button class="btn" onclick="testSettings()">
-            <svg width="14" height="14"><use href="#i-key"/></svg>Test connection</button>
-          <button class="btn" onclick="clearKey()">Clear stored key</button>
-        </div>
-        <div id="set-msg" style="margin-top:var(--s4)"></div>
-      </div>
+        <p class="sub">Configured on the server, not from this page.</p></div></header>
+      <div class="body" id="endpoint-body"></div>
     </div>
 
     <div class="panel">

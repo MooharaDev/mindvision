@@ -4,7 +4,8 @@ webapp_selftest.py — offline end-to-end test of the Corpus web console.
 
 Runs the Flask app in-process (no network, no browser, mock LLM only) against
 a fabricated archive in a temp directory, exercising every API the frontend
-uses: settings (incl. key masking + file permissions), schema library, archive
+uses: settings (server-side-only endpoint config, no key material over the
+API, file permissions), schema library, archive
 staging + scanning + schema drafting, corpus creation by promoting a staging
 area AND via direct upload AND via server path, zip extraction with traversal
 protection, images extraction + serving, paged/filtered/status-filtered tables,
@@ -89,17 +90,25 @@ def main():
     check(not ext, f"zero external URLs in frontend ({ext[:2]})")
     check(client.get("/healthz").get_json()["ok"] is True, "healthz")
 
-    # ---- settings ----
-    r = client.put("/api/settings", json={"llm_base_url": "mock",
-                                          "llm_model": "m-set",
-                                          "llm_api_key": "supersecret9876"})
-    s = r.get_json()
-    check(s["has_key"] and s["key_hint"] == "…9876"
-          and "supersecret" not in r.data.decode(), "settings saved, key masked")
+    # ---- settings: the endpoint is configured server-side only ----
+    # seed the file the way the operator would: by writing it on the server
+    webapp._save_settings({**webapp.DEFAULT_SETTINGS, "llm_model": "m-set",
+                           "llm_api_key": "supersecret9876"})
     mode = stat.S_IMODE(os.stat(webapp.SETTINGS_PATH).st_mode)
     check(mode == 0o600, f"settings.json chmod 600 (got {oct(mode)})")
-    check(client.post("/api/settings/test", json={}).get_json()["ok"],
-          "test connection (mock)")
+    r = client.put("/api/settings", json={"llm_base_url": "http://elsewhere/v1",
+                                          "llm_api_key": "stolen"})
+    check(r.status_code == 403, "endpoint/key cannot be set through the API")
+    r = client.get("/api/settings")
+    s = r.get_json()
+    check(not any(k in s for k in ("llm_base_url", "llm_api_key",
+                                   "has_key", "key_hint"))
+          and "supersecret" not in r.data.decode(),
+          "settings API carries no endpoint or key material")
+    check(s["llm_model"] == "m-set" and s["is_mock"],
+          "settings are read from the server-side file")
+    check(client.post("/api/settings/test", json={}).status_code == 404,
+          "test-connection endpoint removed with the settings UI")
 
     # ---- schema library ----
     bad = client.post("/api/schema/validate", json={"table": "BAD!", "fields": []})
@@ -252,6 +261,9 @@ def main():
     zbuf.seek(0)
     r = client.post("/api/jobs", content_type="multipart/form-data", data={
         "schema": json.dumps(SCHEMA),
+        # a request-supplied endpoint must be IGNORED — otherwise any intranet
+        # user could point the stored key at a URL of their choosing
+        "llm_base_url": "http://elsewhere/v1", "llm_api_key": "stolen",
         "files": [
             (io.BytesIO(pdf_bytes(FILLER, with_image=True)), "caseA/deep/r1.pdf"),
             (io.BytesIO(b"\x89PNG\r\n\x1a\nfake"), "caseA/photo.png"),
@@ -265,7 +277,7 @@ def main():
     check(last["status"] == "done" and last["summary"]["n_records"] == 2,
           f"upload job done with 2 records ({last.get('error')})")
     check(last["endpoint"] == "mock" and last["model"] == "m-set",
-          "job used stored settings")
+          "job used stored settings; request-supplied endpoint ignored")
     rs = (webapp.JOBS_DIR / job / "out" / "run_summary.json").read_text()
     check("supersecret" not in rs, "API key absent from run_summary.json")
 

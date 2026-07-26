@@ -13,8 +13,8 @@ async function loadLedger() {
   el("ledger-banner").innerHTML = (settingsCache && settingsCache.is_mock)
     ? callout("warn", "<strong>Test mode is active.</strong> New corpora are " +
       "filled with fake placeholder values — the mock backend never reads your " +
-      'PDFs. Point Corpus at your internal model in <a href="#/settings">' +
-      "Settings</a>.")
+      "PDFs. The internal endpoint is configured on the server, in " +
+      "<code>webapp_data/settings.json</code>.")
     : "";
   renderLedger();
   clearTimeout(ledgerTimer);

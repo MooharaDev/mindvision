@@ -125,13 +125,13 @@ function paintEndpoint() {
   if (!s) { box.textContent = "unavailable"; return; }
   if (s.is_mock) {
     box.innerHTML = '<span class="st st-needs_review"></span>Test mode (mock)';
-    el("rail-endpoint").title = "Mock backend — fake values, no network call";
+    el("rail-endpoint").title = "Mock backend — fake values, no network call. " +
+      "The real endpoint is configured on the server.";
     return;
   }
-  let host = s.llm_base_url;
-  try { host = new URL(s.llm_base_url).host; } catch { /* not a URL — show as-is */ }
-  box.innerHTML = '<span class="st st-ok"></span>' + esc(s.llm_model || host);
-  el("rail-endpoint").title = s.llm_base_url + " · " + s.llm_model;
+  box.innerHTML = '<span class="st st-ok"></span>' + esc(s.llm_model);
+  el("rail-endpoint").title = s.llm_model +
+    " — configured on the server (webapp_data/settings.json)";
 }
 
 /* ---------------- slide-over drawer (records, schema library) ---------------- */

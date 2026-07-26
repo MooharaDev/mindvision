@@ -169,15 +169,20 @@ corrections are schema-validated and written back to CSV + SQLite with the
 record marked human-verified), retry for failed records, rename, and an export
 panel that explains what every artifact is for.
 
-Settings stores the LLM endpoint, model and API key server-side
-(`webapp_data/settings.json`, chmod 600, masked in the UI, excluded from run
-summaries) so the whole team shares one configuration; a Test-connection
-button probes the gateway.
+The LLM endpoint, model and API key are configured ONLY by editing
+`webapp_data/settings.json` on the server (chmod 600 — owner-only). The web
+UI and API deliberately cannot set, or even read, the endpoint or key: the
+settings API returns just the model name and mock/live state, a PUT carrying
+endpoint fields is refused with 403, and a request-supplied endpoint on job
+creation is ignored — so only the operator who can read that file ever sees
+the configuration, and no browser user can point the stored key at a URL of
+their choosing. The file is re-read on every request, so edits take effect
+without a restart. Keys are excluded from run summaries and logs.
 - Air-gap compliant: the page is fully self-contained (inline CSS/JS, system
   fonts, zero CDN/external requests). The only network traffic is the LLM
-  endpoint configured per run.
+  endpoint configured server-side in `webapp_data/settings.json`.
 - The stored API key lives only in `webapp_data/settings.json` (owner-only
-  permissions); rotate it from Settings, and treat that file like a secret
+  permissions); rotate it by editing that file, and treat it like a secret
   when backing up the data directory.
 - Corpora persist under `./webapp_data/` (override with `PDF2DB_WEB_DATA`);
   finished runs reappear in the ledger after a server restart. An archive

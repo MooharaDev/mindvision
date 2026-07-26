@@ -48,8 +48,6 @@ import sqlite3
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import zipfile
 from collections import Counter
 from datetime import datetime, timezone
@@ -61,7 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pdf2db  # noqa: E402  (the pipeline engine, same directory)
 
 APP_NAME = "Corpus"
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PDF2DB_WEB_DATA") or (Path.cwd() / "webapp_data"))
 JOBS_DIR = DATA_DIR / "jobs"
@@ -159,11 +157,13 @@ def _save_settings(s):
 
 
 def _public_settings(s):
-    key = s.get("llm_api_key") or ""
+    """What the browser is allowed to see. The extraction endpoint, model and
+    API key are configured ONLY by editing webapp_data/settings.json on the
+    server (owner-only file, read on every request — no restart needed); the
+    API never accepts or returns endpoint or key material. The UI gets just
+    enough to warn about mock mode and name the model in provenance text."""
     tess = pdf2db.tessdata_dir(pdf2db.CONFIG)
-    return {"llm_base_url": s["llm_base_url"], "llm_model": s["llm_model"],
-            "has_key": bool(key),
-            "key_hint": ("…" + key[-4:]) if len(key) >= 8 else ("set" if key else ""),
+    return {"llm_model": s["llm_model"],
             "is_mock": s["llm_base_url"].strip() == "mock",
             "ocr_mode": s.get("ocr_mode", "off"),
             "ocr_language": s.get("ocr_language", "eng"),
@@ -753,13 +753,14 @@ def api_get_settings():
 @app.put("/api/settings")
 def api_put_settings():
     body = request.get_json(force=True, silent=True) or {}
+    if any(k in body for k in ("llm_base_url", "llm_model", "llm_api_key")):
+        # deliberate: the endpoint and key must never be settable from the
+        # browser — the operator edits settings.json on the server directly
+        return jsonify({"error": "the extraction endpoint is configured on the "
+                                 "server only — edit webapp_data/settings.json "
+                                 "(owner-only file); it cannot be set through "
+                                 "the API or the UI"}), 403
     s = _load_settings()
-    if "llm_base_url" in body:
-        s["llm_base_url"] = str(body["llm_base_url"]).strip() or "mock"
-    if "llm_model" in body:
-        s["llm_model"] = str(body["llm_model"]).strip() or "internal-model"
-    if "llm_api_key" in body:  # absent = keep; "" = clear; value = replace
-        s["llm_api_key"] = str(body["llm_api_key"])
     if "ocr_mode" in body:
         mode = str(body["ocr_mode"]).strip()
         if mode not in pdf2db.OCR_MODES:
@@ -783,42 +784,6 @@ def api_put_settings():
         s["ocr_dpi"] = dpi
     _save_settings(s)
     return jsonify(_public_settings(s))
-
-
-@app.post("/api/settings/test")
-def api_test_settings():
-    """Probe an endpoint (GET /models) without saving anything."""
-    body = request.get_json(force=True, silent=True) or {}
-    s = _load_settings()
-    base = (body.get("llm_base_url") or s["llm_base_url"]).strip()
-    key = body.get("llm_api_key")
-    if key in (None, ""):
-        key = s["llm_api_key"]
-    if base == "mock":
-        return jsonify({"ok": True, "detail": "mock backend — offline test mode "
-                                              "(fake values, no network call)"})
-    url = base.rstrip("/") + "/models"
-    headers = {"User-Agent": "pdf2db/1.0"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with opener.open(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        models = [m.get("id") for m in data.get("data", [])][:50]
-        return jsonify({"ok": True,
-                        "detail": f"endpoint reachable — {len(models)} models "
-                                  f"available", "models": models})
-    except urllib.error.HTTPError as e:
-        det = ""
-        try:
-            det = e.read()[:200].decode("utf-8", "replace")
-        except OSError:
-            pass
-        return jsonify({"ok": False, "detail": f"HTTP {e.code}: {det}"})
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-        return jsonify({"ok": False, "detail": f"{type(e).__name__}: {e}"})
 
 
 @app.post("/api/server-path/check")
@@ -1134,15 +1099,12 @@ def api_suggest_schema(sid):
 
 
 # ---- databases (jobs) ----
-def _llm_cfg_from(form_or_json, settings):
-    """LLM config for a run: stored settings, overridable per request."""
-    get = form_or_json.get
-    base = (get("llm_base_url") or settings["llm_base_url"]).strip()
-    model = (get("llm_model") or settings["llm_model"]).strip()
-    key = get("llm_api_key")
-    if key in (None, ""):
-        key = settings["llm_api_key"]
-    return base, model, key
+def _llm_cfg(settings):
+    """LLM config for a run — stored server-side settings ONLY. A request must
+    never be able to point a run (and the stored key) at a caller-chosen URL;
+    the operator configures the endpoint in webapp_data/settings.json."""
+    return (settings["llm_base_url"].strip(), settings["llm_model"].strip(),
+            settings["llm_api_key"])
 
 
 @app.post("/api/jobs")
@@ -1218,7 +1180,7 @@ def api_create_job():
     _write_meta(job_dir, meta)
 
     settings = _load_settings()
-    base_url, model, key = _llm_cfg_from(request.form, settings)
+    base_url, model, key = _llm_cfg(settings)
     ingest, ing_errs = _ingest_cfg_from(request.form, settings)
     if ing_errs:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1255,8 +1217,7 @@ def api_retry_job(job_id):
     root = _job_root(job_id)
     if not schema_path.exists() or not root.is_dir():
         return jsonify({"error": "database artifacts are missing on disk"}), 409
-    body = request.get_json(force=True, silent=True) or {}
-    base_url, model, key = _llm_cfg_from(body, _load_settings())
+    base_url, model, key = _llm_cfg(_load_settings())
     if (out_dir / "records_text.csv").exists():
         # backfill the images stage for databases created before it existed
         stages = "llm,load" if (out_dir / "images.csv").exists() \

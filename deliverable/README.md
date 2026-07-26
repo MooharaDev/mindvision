@@ -71,10 +71,22 @@ Then open `http://<this-server>:8080` in a browser. It should print
 
 ## 5. First use, in the browser
 
-1. **Settings** → enter the internal gateway's **Base URL** (ends in `/v1`),
-   the **model name**, and an **API key** if the gateway needs one →
-   **Test connection**. Until you do this it runs in `mock` mode and produces
-   fake placeholder values.
+1. **Configure the extraction endpoint — on the server, not in the browser.**
+   Edit `webapp_data/settings.json` (create it next to where the server runs,
+   or under `PDF2DB_WEB_DATA`) as the user that runs the app:
+
+   ```json
+   {
+    "llm_base_url": "https://gateway.internal/v1",
+    "llm_model": "internal-model",
+    "llm_api_key": "the-key-if-the-gateway-needs-one"
+   }
+   ```
+
+   Then `chmod 600 webapp_data/settings.json`. The file is read on every
+   request — no restart needed. The UI never shows, accepts, or transmits the
+   URL or key; only the operator who can read this file sees them. Until the
+   file exists it runs in `mock` mode and produces fake placeholder values.
 2. **New corpus** → step 1, give it the archive:
    - *Folder on this server* — paste an absolute path. Read in place, nothing
      is copied. **Use this for large archives.**

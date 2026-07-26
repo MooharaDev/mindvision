@@ -20,7 +20,7 @@ import time
 import zipfile
 from pathlib import Path
 
-VERSION = "4.1"
+VERSION = "4.2"
 BASE = Path(__file__).resolve().parent
 FILES = [
     "pdf2db.py",
