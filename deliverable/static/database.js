@@ -451,7 +451,9 @@ async function renderExport() {
       "them.</p></div>";
     return;
   }
-  const unit = cschema && cschema.record_unit === "pdf" ? "PDF" : "folder";
+  /* what one row of records.csv actually IS, in the words of the grouping the
+     corpus was built with — the training split depends on getting this right */
+  const unit = recordUnitWord(cschema && cschema.record_unit);
   el("c-panelbody").innerHTML =
     '<div class="body"><dl class="filelist">' + files.map(f =>
       '<div class="row"><div style="flex:1;min-width:0">' +
@@ -579,7 +581,7 @@ async function openRecord(recordId, forceEdit) {
 
   const prov = ["source_paths", "n_pdfs", "n_pages", "chars_extracted",
                 "n_images", "llm_model", "llm_attempts", "extracted_at",
-                "truncated", "low_yield", "scanned_suspect", "_notes"]
+                "truncated", "low_yield", "scanned_suspect", "ocr_pages", "_notes"]
     .filter(c => val[c] !== undefined && val[c] !== "");
   if (prov.length) {
     const FLAGS = ["truncated", "low_yield", "scanned_suspect"];
@@ -664,14 +666,28 @@ async function submitReview(recordId, withCorrections) {
   }
   toast(withCorrections ? "Corrections saved — marked reviewed"
                         : "Approved — marked reviewed");
-  const more = reviewIdx >= 0 && reviewIdx < reviewList.length - 1;
-  if (more) { reviewIdx += 1; openRecord(reviewList[reviewIdx]); }
-  else closeDrawer();
-  loadCorpusHeader().then(() => { if (ctab !== "overview") loadTable(); });
+  // this record is done: drop it from the working list so the "N of M" counter
+  // and the next/prev arrows describe what is actually still outstanding
+  if (reviewIdx >= 0) reviewList.splice(reviewIdx, 1);
+  if (reviewIdx >= 0 && reviewIdx < reviewList.length) openRecord(reviewList[reviewIdx]);
+  else { reviewIdx = -1; reviewList = []; closeDrawer(); }
+  // header counts AND the overview charts both move when a record is reviewed
+  loadCorpusHeader().then(() => renderTab());
 }
 
 onAct("save-review", d => submitReview(d.id, true));
 onAct("approve-review", d => submitReview(d.id, false));
+
+/* Plain-English name for whatever grouping this corpus was built with, so the
+   export tab can say what one row of records.csv actually represents. */
+function recordUnitWord(unit) {
+  unit = unit || "folder";
+  if (unit === "pdf") return "PDF";
+  if (unit === "parent") return "folder of PDFs";
+  if (unit.indexOf("depth:") === 0) return "folder " + unit.split(":")[1] + " level(s) down";
+  if (unit.indexOf("regex:") === 0) return "identifier found in the path";
+  return "folder";
+}
 
 /* ---------- review workspace ---------- */
 onAct("start-review", async () => {

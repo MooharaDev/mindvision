@@ -94,7 +94,20 @@ STATUS_ORDER = ["ok", "reviewed", "needs_review", "pending_llm", "no_text",
 MAX_ZIP_MEMBERS = 20000
 MAX_ZIP_BYTES = 6 * 1024 ** 3
 DEFAULT_SETTINGS = {"llm_base_url": "mock", "llm_model": "internal-model",
-                    "llm_api_key": ""}
+                    "llm_api_key": "",
+                    # OCR is a property of the host (is the tesseract binary there?),
+                    # so it lives in settings and every new corpus inherits it
+                    "ocr_mode": "off", "ocr_language": "eng", "ocr_dpi": 300}
+
+# pdf2db CONFIG keys the console is allowed to set per corpus. Everything else
+# stays at the engine default: this is the whole surface the UI can touch, so a
+# new knob has to be added here deliberately rather than by accident.
+INGEST_KEYS = {
+    "record_unit": str, "include_globs": str, "exclude_globs": str,
+    "file_order": str, "dedupe_identical": bool, "max_depth": int,
+    "max_file_mb": int, "sniff_all_files": bool,
+    "ocr_mode": str, "ocr_language": str, "ocr_dpi": int,
+}
 
 # ---- archive preview + schema drafting ----
 STAGING_TTL_S = 24 * 3600      # abandoned staging areas are swept at startup
@@ -147,10 +160,17 @@ def _save_settings(s):
 
 def _public_settings(s):
     key = s.get("llm_api_key") or ""
+    tess = pdf2db.tessdata_dir(pdf2db.CONFIG)
     return {"llm_base_url": s["llm_base_url"], "llm_model": s["llm_model"],
             "has_key": bool(key),
             "key_hint": ("…" + key[-4:]) if len(key) >= 8 else ("set" if key else ""),
-            "is_mock": s["llm_base_url"].strip() == "mock"}
+            "is_mock": s["llm_base_url"].strip() == "mock",
+            "ocr_mode": s.get("ocr_mode", "off"),
+            "ocr_language": s.get("ocr_language", "eng"),
+            "ocr_dpi": s.get("ocr_dpi", 300),
+            # the console must not offer OCR the host cannot actually perform
+            "ocr_available": tess is not None,
+            "ocr_tessdata": tess or ""}
 
 
 # ------------------------------------------------------------------ job state
@@ -281,8 +301,10 @@ def _pick_spread(items, k):
 
 
 def _probe_pdf(root, rel):
-    """Open one PDF and measure how much text it actually yields."""
-    pages, err = pdf2db.extract_pdf_text(Path(root) / rel)
+    """Open one PDF and measure how much text it actually yields.
+    Always a plain text-layer read: the preview must stay fast and must show
+    what the archive contains BEFORE any OCR is switched on."""
+    pages, err, _meta = pdf2db.extract_pdf_text(Path(root) / rel)
     if err:
         return {"rel_path": rel, "error": err, "n_pages": 0, "chars": 0,
                 "chars_per_page": 0, "preview": ""}
@@ -298,8 +320,11 @@ def _scan_archive(root):
     records each record_unit would produce, and how much text the PDFs yield.
     Read-only — writes nothing, so the operator can look before committing."""
     root = Path(root)
-    pdfs, n_images, n_other, n_bytes = [], 0, 0, 0
+    pdfs, n_images, n_other, n_bytes, n_filtered = [], 0, 0, 0, 0
     n_seen, truncated = 0, False
+    # the SAME default filters the run will apply, so the preview cannot promise
+    # documents that discovery then drops (lock files, dotfiles, macOS cruft)
+    excludes = pdf2db.split_globs(pdf2db.CONFIG["exclude_globs"])
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for fn in sorted(filenames):
@@ -315,8 +340,12 @@ def _scan_archive(root):
             except OSError:
                 n_other += 1
                 continue
+            rel = p.relative_to(root).as_posix()
+            if pdf2db.filter_reason(rel, size, [], excludes, 0, 0):
+                n_filtered += int(magic == b"%PDF-")
+                continue
             if magic == b"%PDF-":
-                pdfs.append(p.relative_to(root).as_posix())
+                pdfs.append(rel)
                 n_bytes += size
             elif p.suffix.lower() in IMAGE_EXTS:
                 n_images += 1
@@ -325,22 +354,109 @@ def _scan_archive(root):
         if truncated:
             break
     pdfs.sort()
-    units = {}
-    for unit in ("folder", "pdf"):
-        ids = sorted({pdf2db.assign_record_id(r, unit)[0] for r in pdfs})
-        units[unit] = {"n_records": len(ids), "examples": ids[:6]}
+    max_depth = max((r.count("/") + 1 for r in pdfs), default=0)
+    units = _score_units(pdfs, max_depth)
+    patterns = _id_patterns(pdfs)
     probed = [_probe_pdf(root, r) for r in _pick_spread(pdfs, PROBE_DOCS)]
     low = [s for s in probed
            if s["error"] or s["chars_per_page"] < pdf2db.CONFIG["scan_chars_per_page"]]
     return {
         "n_pdfs": len(pdfs), "n_images": n_images, "n_other": n_other,
         "n_bytes": n_bytes, "truncated": truncated,
-        "depth": max((r.count("/") + 1 for r in pdfs), default=0),
+        "depth": max_depth,
         "n_loose": sum(1 for r in pdfs if "/" not in r),
         "units": units,
+        "suggested_unit": _suggest_unit(units, pdfs, patterns),
+        "id_patterns": patterns,
+        "n_filtered": n_filtered,
+        "ocr": {"available": pdf2db.tessdata_dir(pdf2db.CONFIG) is not None,
+                "recommended": bool(probed) and len(low) >= max(1, len(probed) // 2)},
         "probe": {"n_probed": len(probed), "n_low_yield": len(low),
                   "samples": probed},
+        "_pdfs": pdfs,   # popped by the caller and stored separately
     }
+
+
+# Identifier shapes worth offering as a regex grouping. Ordered most specific
+# first; the preview shows how many records each would actually produce so the
+# operator picks on evidence rather than on the label.
+ID_PATTERN_CANDIDATES = [
+    (r"(?P<id>[A-Z]{2,5}[-_]?\d{3,8})", "letters + digits, e.g. INC-2231"),
+    (r"(?P<id>\d{4}[-_]\d{3,6})", "year-number, e.g. 2003-0147"),
+    (r"(?P<id>\d{6,10})", "a long digit run, e.g. 00231847"),
+]
+
+
+def _score_units(pdfs, max_depth):
+    """How many records each grouping mode would produce over this archive, so
+    the choice is made against real counts instead of a guess."""
+    units = {}
+    specs = ["pdf", "folder", "parent"] + \
+            [f"depth:{d}" for d in range(2, min(max_depth, 5))]
+    for spec in specs:
+        try:
+            unit = pdf2db.parse_record_unit(spec)
+        except ValueError:
+            continue
+        ids, unmatched = set(), 0
+        for rel in pdfs:
+            rid, warn = pdf2db.assign_record_id(rel, unit)
+            ids.add(rid)
+            unmatched += bool(warn)
+        units[spec] = {"n_records": len(ids), "examples": sorted(ids)[:6],
+                       "n_unmatched": unmatched}
+    return units
+
+
+def _id_patterns(pdfs):
+    """Try each candidate id shape against the paths and report what it would
+    do. Only patterns that match most of the archive are worth offering."""
+    out = []
+    for pattern, label in ID_PATTERN_CANDIDATES:
+        spec = f"regex:{pattern}"
+        unit = pdf2db.parse_record_unit(spec)
+        ids, matched = set(), 0
+        for rel in pdfs:
+            rid, warn = pdf2db.assign_record_id(rel, unit)
+            ids.add(rid)
+            matched += not warn
+        if matched >= max(1, int(len(pdfs) * 0.6)):
+            out.append({"record_unit": spec, "label": label,
+                        "n_records": len(ids), "n_matched": matched,
+                        "coverage": round(100.0 * matched / max(1, len(pdfs))),
+                        "examples": sorted(i for i in ids if i)[:6]})
+    return out
+
+
+def _suggest_unit(units, pdfs, patterns):
+    """Recommend a grouping.
+
+    Deliberately NOT "whichever makes the fewest records": over-merging silently
+    fuses unrelated incidents into one row, which is far more damaging than
+    splitting one incident into two. The order below is by strength of evidence:
+
+      1. an identifier the archive itself puts in nearly every path — the
+         archive is telling us what a record is
+      2. the folder each PDF sits directly in — the usual "one case per folder"
+      3. the top-level folder
+      4. one record per file, which is always correct and never insightful
+    """
+    n = len(pdfs)
+    if n == 0:
+        return "folder"
+
+    def sane(spec):
+        u = units.get(spec) or {}
+        return 1 < u.get("n_records", 0) < n and not u.get("n_unmatched")
+
+    best = max((p for p in patterns if p["coverage"] >= 95 and 1 < p["n_records"] <= n),
+               key=lambda p: (p["coverage"], -p["n_records"]), default=None)
+    if best:
+        return best["record_unit"]
+    for spec in ("parent", "folder"):
+        if sane(spec):
+            return spec
+    return "folder" if units.get("folder", {}).get("n_records", 0) > 1 else "pdf"
 
 
 def _record_text(root, rel_paths, budget):
@@ -348,7 +464,7 @@ def _record_text(root, rel_paths, budget):
     text a schema is drafted from matches the text it will be applied to."""
     chunks = []
     for rel in rel_paths:
-        pages, err = pdf2db.extract_pdf_text(Path(root) / rel)
+        pages, err, _meta = pdf2db.extract_pdf_text(Path(root) / rel)
         if err:
             continue
         chunks.append(f"===== FILE: {rel} =====\n" + "\n".join(pages))
@@ -379,13 +495,31 @@ GENERIC_SCHEMA = {
 }
 
 
+def _unit_phrase(unit):
+    """Plain-English gloss of a record_unit, for the schema-drafting prompt and
+    for the console. The model reads this to understand what a record IS."""
+    unit = (unit or "folder").strip()
+    if unit == "pdf":
+        return "one PDF file"
+    if unit == "folder":
+        return "one top-level subfolder of the archive (its PDFs merged)"
+    if unit == "parent":
+        return "one folder of PDFs (the folder a document sits directly in)"
+    if unit.startswith("depth:"):
+        return (f"one folder {unit.split(':', 1)[1]} level(s) below the archive "
+                f"root (all PDFs beneath it merged)")
+    if unit.startswith("regex:"):
+        return ("one identifier found in the file path (all documents sharing "
+                "that identifier merged into a single record)")
+    return "one record"
+
+
 def _suggest_user_prompt(samples, unit, n_records):
     reserved = ", ".join(sorted(pdf2db.RESERVED_COLUMNS))
     docs = "\n\n".join(
         f"===== SAMPLE {i + 1} (record: {s['record_id']}) =====\n{s['text']}"
         for i, s in enumerate(samples))
-    unit_word = ("one top-level subfolder of the archive (its PDFs merged)"
-                 if unit == "folder" else "one PDF file")
+    unit_word = _unit_phrase(unit)
     return f"""Below are {len(samples)} sample documents drawn from an archive \
 of {n_records} records. One record = {unit_word}.
 
@@ -473,6 +607,38 @@ def _draft_schema(settings, samples, unit, n_records):
     return None, {}, "llm", last_err
 
 
+def _ingest_cfg_from(source, settings=None):
+    """Pull the ingest knobs out of a form/JSON body, coercing and validating
+    every one. Returns (cfg_overrides, errors) — an invalid value is reported,
+    never silently swapped for a default, because grouping quietly changing
+    under the operator is exactly the failure this feature exists to remove."""
+    over, errs = {}, []
+    if settings:   # host-level OCR defaults; the per-corpus form may override
+        for k in ("ocr_mode", "ocr_language", "ocr_dpi"):
+            if k in settings:
+                over[k] = settings[k]
+    get = source.get
+    for key, kind in INGEST_KEYS.items():
+        raw = get(key)
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""
+                           and key not in ("include_globs", "exclude_globs")):
+            continue
+        if kind is bool:
+            over[key] = raw if isinstance(raw, bool) else \
+                str(raw).strip().lower() in ("1", "true", "yes", "on")
+        elif kind is int:
+            try:
+                over[key] = int(raw)
+            except (TypeError, ValueError):
+                errs.append(f"{key} must be a whole number, got {raw!r}")
+        else:
+            over[key] = str(raw).strip()
+    probe = dict(pdf2db.CONFIG)
+    probe.update(over)
+    errs += pdf2db.validate_cfg(probe)
+    return over, errs
+
+
 def _run_job(job_id, cfg):
     def cb(stage, done=0, total=0):
         pct = STAGE_PCT.get(stage, 0)
@@ -491,6 +657,40 @@ def _run_job(job_id, cfg):
         _set(job_id, status="failed", error="pipeline aborted — see server log")
     except Exception as e:  # surface anything to the UI; never kill the server
         _set(job_id, status="failed", error=f"{type(e).__name__}: {e}")
+
+
+def _with_live_counts(job_id, job):
+    """Overlay the CURRENT record statuses onto the run summary.
+
+    `summary` is frozen when the pipeline finishes, but reviewing a record
+    changes its status afterwards — so a header painted from the frozen numbers
+    would keep claiming records need review long after a human cleared them.
+    The `records` table is the thing the review endpoint actually writes, so it
+    is the only honest source for these counts. Falls back to the frozen summary
+    whenever the database is absent or mid-write.
+    """
+    summary = job.get("summary")
+    if not summary or job.get("status") == "running":
+        return job
+    _, _, _, out_dir = _job_paths(job_id)
+    db_path = out_dir / f"{job.get('table', 'records')}.db"
+    if not db_path.exists():
+        return job
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            counts = dict(con.execute(
+                'SELECT "status", COUNT(*) FROM "records" GROUP BY "status"'))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return job          # mid-write: last known good numbers beat an error
+    live = dict(summary)
+    live["status_counts"] = {k: v for k, v in sorted(counts.items()) if k}
+    live["n_review_queue"] = counts.get("needs_review", 0)
+    live["n_records"] = sum(counts.values())
+    job["summary"] = live
+    return job
 
 
 def _rescan_jobs():
@@ -560,6 +760,27 @@ def api_put_settings():
         s["llm_model"] = str(body["llm_model"]).strip() or "internal-model"
     if "llm_api_key" in body:  # absent = keep; "" = clear; value = replace
         s["llm_api_key"] = str(body["llm_api_key"])
+    if "ocr_mode" in body:
+        mode = str(body["ocr_mode"]).strip()
+        if mode not in pdf2db.OCR_MODES:
+            return jsonify({"error": f"ocr_mode must be one of "
+                                     f"{list(pdf2db.OCR_MODES)}"}), 400
+        if mode != "off" and pdf2db.tessdata_dir(pdf2db.CONFIG) is None:
+            return jsonify({"error": "Tesseract is not installed on this server, so OCR "
+                                     "cannot be switched on. Ask for the tesseract OS "
+                                     "package (plus its language data) to be provisioned, "
+                                     "then set TESSDATA_PREFIX."}), 400
+        s["ocr_mode"] = mode
+    if "ocr_language" in body:
+        s["ocr_language"] = str(body["ocr_language"]).strip() or "eng"
+    if "ocr_dpi" in body:
+        try:
+            dpi = int(body["ocr_dpi"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "ocr_dpi must be a whole number"}), 400
+        if not 72 <= dpi <= 1200:
+            return jsonify({"error": "ocr_dpi must be between 72 and 1200"}), 400
+        s["ocr_dpi"] = dpi
     _save_settings(s)
     return jsonify(_public_settings(s))
 
@@ -790,6 +1011,7 @@ def api_create_staging():
                                 "details": skipped[:10]}), 400
             root = sdir / "archive"
         scan = _scan_archive(root)
+        pdf_list = scan.pop("_pdfs", [])
     except OSError as e:
         shutil.rmtree(sdir, ignore_errors=True)
         return jsonify({"error": f"could not read the archive: {e}"}), 400
@@ -803,8 +1025,38 @@ def api_create_staging():
     _write_meta(sdir, meta)
     (sdir / "scan.json").write_text(json.dumps(scan, ensure_ascii=False,
                                                indent=1), encoding="utf-8")
+    # the discovered paths, kept so a custom grouping can be previewed without
+    # walking the archive again (the walk is the slow part, not the grouping)
+    (sdir / "pdfs.json").write_text(json.dumps(pdf_list), encoding="utf-8")
     return jsonify({"staging_id": sid, "scan": scan, "source": source_name,
                     "skipped": skipped[:20]})
+
+
+@app.post("/api/staging/<sid>/grouping")
+def api_preview_grouping(sid):
+    """Score one record_unit against the staged archive: how many records it
+    makes, what they are called, and how many PDFs it fails to place. Lets the
+    operator type a regex and see the consequence before committing."""
+    sdir = _staging_dir(sid)
+    p = sdir / "pdfs.json"
+    if not p.exists():
+        abort(404)
+    body = request.get_json(force=True, silent=True) or {}
+    spec = (body.get("record_unit") or "").strip()
+    try:
+        unit = pdf2db.parse_record_unit(spec)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    pdfs = json.loads(p.read_text())
+    ids, unmatched = set(), 0
+    for rel in pdfs:
+        rid, warn = pdf2db.assign_record_id(rel, unit)
+        ids.add(rid)
+        unmatched += bool(warn)
+    return jsonify({"ok": True, "record_unit": spec, "n_records": len(ids),
+                    "n_pdfs": len(pdfs), "n_unmatched": unmatched,
+                    "examples": sorted(ids)[:8],
+                    "phrase": _unit_phrase(spec)})
 
 
 @app.get("/api/staging/<sid>")
@@ -829,8 +1081,11 @@ def api_suggest_schema(sid):
     send their text to the configured model, validate what comes back."""
     sdir = _staging_dir(sid)
     body = request.get_json(force=True, silent=True) or {}
-    unit = body.get("record_unit") if body.get("record_unit") in ("folder", "pdf") \
-        else "folder"
+    unit = (body.get("record_unit") or "folder").strip() or "folder"
+    try:
+        pdf2db.parse_record_unit(unit)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"invalid grouping: {e}"}), 400
     scan_path = sdir / "scan.json"
     if not scan_path.exists():
         abort(404)
@@ -869,7 +1124,8 @@ def api_suggest_schema(sid):
 
     settings = _load_settings()
     schema, examples, source, err = _draft_schema(
-        settings, samples, unit, scan["units"][unit]["n_records"])
+        settings, samples, unit,
+        (scan.get("units", {}).get(unit) or {}).get("n_records", len(by_record)))
     if schema is None:
         return jsonify({"ok": False, "error": err, "source": source}), 200
     return jsonify({"ok": True, "schema": schema, "examples": examples,
@@ -961,8 +1217,17 @@ def api_create_job():
                  "skipped": skipped[:50]})
     _write_meta(job_dir, meta)
 
-    base_url, model, key = _llm_cfg_from(request.form, _load_settings())
+    settings = _load_settings()
+    base_url, model, key = _llm_cfg_from(request.form, settings)
+    ingest, ing_errs = _ingest_cfg_from(request.form, settings)
+    if ing_errs:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": "invalid ingest options",
+                        "details": ing_errs}), 400
+    meta["ingest"] = ingest          # so Retry reproduces the same reading of the archive
+    _write_meta(job_dir, meta)
     cfg = dict(pdf2db.CONFIG)
+    cfg.update(ingest)
     cfg.update({
         "root": str(root), "schema": str(schema_path), "out": str(out_dir),
         "llm_base_url": base_url, "llm_model": model, "llm_api_key": key,
@@ -986,7 +1251,7 @@ def api_retry_job(job_id):
             abort(404)
         if job["status"] == "running":
             return jsonify({"error": "database is already processing"}), 409
-    _, _, schema_path, out_dir = _job_paths(job_id)
+    job_dir, _, schema_path, out_dir = _job_paths(job_id)
     root = _job_root(job_id)
     if not schema_path.exists() or not root.is_dir():
         return jsonify({"error": "database artifacts are missing on disk"}), 409
@@ -999,6 +1264,9 @@ def api_retry_job(job_id):
     else:
         stages = "discover,extract,images,llm,load"
     cfg = dict(pdf2db.CONFIG)
+    # reuse the ingest options this corpus was built with, so a retry cannot
+    # silently regroup or re-OCR the archive differently from the first pass
+    cfg.update((_read_meta(job_dir) or {}).get("ingest") or {})
     cfg.update({"root": str(root), "schema": str(schema_path),
                 "out": str(out_dir), "llm_base_url": base_url,
                 "llm_model": model, "llm_api_key": key,
@@ -1014,7 +1282,10 @@ def api_retry_job(job_id):
 def api_list_jobs():
     with JOBS_LOCK:
         jobs = sorted(JOBS.values(), key=lambda j: j["id"], reverse=True)
-        return jsonify([dict(j) for j in jobs])
+        jobs = [dict(j) for j in jobs]
+    # same live counts as the corpus header, so the ledger's "needs review"
+    # totals cannot disagree with the corpus you open from it
+    return jsonify([_with_live_counts(j["id"], j) for j in jobs])
 
 
 @app.get("/api/jobs/<job_id>/status")
@@ -1023,7 +1294,8 @@ def api_job_status(job_id):
         job = JOBS.get(job_id)
         if job is None:
             abort(404)
-        return jsonify(dict(job))
+        job = dict(job)
+    return jsonify(_with_live_counts(job_id, job))
 
 
 @app.delete("/api/jobs/<job_id>")

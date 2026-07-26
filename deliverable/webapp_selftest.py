@@ -129,6 +129,81 @@ def main():
           "staging scan measures real text yield")
     check(client.get(f"/api/staging/{sid}").get_json()["scan"]["n_pdfs"] == 2,
           "a staging area can be re-read")
+
+    # ---- grouping: every mode scored, custom patterns previewed live ----
+    nested = client.post("/api/staging", content_type="multipart/form-data", data={
+        "source_name": "nested_archive",
+        "files": [(io.BytesIO(pdf_bytes(FILLER)), "2003/Q1/INC-2231/report.pdf"),
+                  (io.BytesIO(pdf_bytes(FILLER)), "2003/Q1/INC-2231/annex.pdf"),
+                  (io.BytesIO(pdf_bytes(FILLER)), "2003/Q1/INC-2232/report.pdf"),
+                  (io.BytesIO(pdf_bytes(FILLER)), "2004/Q3/INC-2240/report.pdf")]}).get_json()
+    nsid, nscan = nested["staging_id"], nested["scan"]
+    check(nscan["units"]["folder"]["n_records"] == 2
+          and nscan["units"]["parent"]["n_records"] == 3
+          and nscan["units"]["pdf"]["n_records"] == 4,
+          f"preflight scores folder/parent/pdf separately ({nscan['units']})")
+    check("depth:2" in nscan["units"] and nscan["units"]["depth:2"]["n_records"] == 2,
+          f"preflight offers intermediate depths ({sorted(nscan['units'])})")
+    check(nscan["suggested_unit"] != "pdf" and nscan["suggested_unit"] != "folder",
+          f"preflight recommends a grouping that is neither all-in-one nor "
+          f"one-per-file ({nscan['suggested_unit']})")
+    pats = nscan["id_patterns"]
+    check(pats and pats[0]["n_records"] == 3 and pats[0]["coverage"] == 100,
+          f"preflight detects the INC identifier in the paths ({pats})")
+    gp = client.post(f"/api/staging/{nsid}/grouping",
+                     json={"record_unit": r"regex:(?P<id>INC-\d+)"}).get_json()
+    check(gp["ok"] and gp["n_records"] == 3 and gp["n_unmatched"] == 0
+          and "INC-2231" in gp["examples"],
+          f"custom pattern previewed against the real paths ({gp})")
+    bad = client.post(f"/api/staging/{nsid}/grouping",
+                      json={"record_unit": "regex:(unclosed"})
+    check(bad.status_code == 400 and "error" in bad.get_json(),
+          "an invalid pattern is rejected with a message, not a crash")
+    check(client.post(f"/api/staging/{nsid}/grouping",
+                      json={"record_unit": "depth:0"}).status_code == 400,
+          "an invalid depth is rejected")
+    # build the nested archive grouped by identifier, end to end
+    nr = client.post("/api/jobs", content_type="multipart/form-data",
+                     data={"schema": json.dumps(SCHEMA), "staging_id": nsid,
+                           "title": "Nested", "record_unit": r"regex:(?P<id>INC-\d+)"})
+    njob = nr.get_json()["job_id"]
+    nstate = wait_done(njob)
+    nrecs = client.get(f"/api/jobs/{njob}/table/records?limit=50").get_json()
+    ri, pi = nrecs["columns"].index("record_id"), nrecs["columns"].index("n_pdfs")
+    nids = sorted(row[ri] for row in nrecs["rows"])
+    check(nstate["status"] == "done" and nids == ["INC-2231", "INC-2232", "INC-2240"],
+          f"regex grouping produces per-incident records end to end ({nids})")
+    check(next(r[pi] for r in nrecs["rows"] if r[ri] == "INC-2231") == 2,
+          "both PDFs of one incident merge into a single record")
+    check((webapp.JOBS_DIR / njob / "meta.json").exists()
+          and json.loads((webapp.JOBS_DIR / njob / "meta.json").read_text())
+          .get("ingest", {}).get("record_unit") == r"regex:(?P<id>INC-\d+)",
+          "the grouping is stored on the corpus so Retry cannot change it")
+    # a fresh staging area: promoting one MOVES it, so nsid is spent by now
+    bsid = client.post("/api/staging", content_type="multipart/form-data", data={
+        "source_name": "bad_group",
+        "files": [(io.BytesIO(pdf_bytes(FILLER)), "x/one.pdf")]}).get_json()["staging_id"]
+    rbad = client.post("/api/jobs", content_type="multipart/form-data",
+                       data={"schema": json.dumps(SCHEMA), "staging_id": bsid,
+                             "record_unit": "regex:(bad"})
+    check(rbad.status_code == 400 and "details" in rbad.get_json(),
+          f"a corpus cannot be created with an invalid grouping ({rbad.status_code})")
+
+    # ---- OCR settings are gated on the binary actually being present ----
+    s_now = client.get("/api/settings").get_json()
+    check("ocr_available" in s_now and "ocr_mode" in s_now,
+          "settings report whether this server can OCR at all")
+    check(client.put("/api/settings", json={"ocr_mode": "sideways"}).status_code == 400,
+          "an unknown ocr_mode is refused")
+    if s_now["ocr_available"]:
+        check(client.put("/api/settings", json={"ocr_mode": "auto"}).get_json()
+              ["ocr_mode"] == "auto", "OCR can be enabled where tesseract exists")
+        check(client.put("/api/settings", json={"ocr_dpi": 5}).status_code == 400,
+              "an out-of-range ocr_dpi is refused")
+        client.put("/api/settings", json={"ocr_mode": "off"})
+    else:
+        check(client.put("/api/settings", json={"ocr_mode": "auto"}).status_code == 400,
+              "OCR cannot be enabled when tesseract is absent")
     sug = client.post(f"/api/staging/{sid}/suggest-schema",
                       json={"record_unit": "folder"}).get_json()
     check(sug["ok"] and sug["source"] == "generic" and sug["schema"]["fields"],
@@ -234,6 +309,11 @@ def main():
 
     # ---- review: invalid rejected, valid written back to SQLite ----
     rid = p1["rows"][0][p1["columns"].index("record_id")]
+    # the counts the corpus header paints MUST track reviews, not the frozen
+    # run summary — otherwise the UI claims work is outstanding forever
+    before = client.get(f"/api/jobs/{job}/status").get_json()["summary"]
+    check(before["n_review_queue"] > 0,
+          f"status reports records awaiting review ({before['n_review_queue']})")
     check(client.post(f"/api/jobs/{job}/review",
                       json={"record_id": rid, "verdict": "corrected",
                             "reviewer": "T", "corrections": {"category": "NOPE"}})
@@ -251,6 +331,15 @@ def main():
     con.close()
     check(row == ("beta", "reviewed"), f"correction + reviewed in SQLite ({row})")
     check(n_img_db == t["total"], "images table in SQLite matches API")
+    after = client.get(f"/api/jobs/{job}/status").get_json()["summary"]
+    check(after["n_review_queue"] == before["n_review_queue"] - 1,
+          f"reviewing a record drops the header's needs-review count "
+          f"({before['n_review_queue']} -> {after['n_review_queue']})")
+    check(after["status_counts"].get("reviewed", 0) >= 1,
+          f"status_counts reflects the review live ({after['status_counts']})")
+    listed = next(j for j in client.get("/api/jobs").get_json() if j["id"] == job)
+    check(listed["summary"]["n_review_queue"] == after["n_review_queue"],
+          "the corpora ledger agrees with the corpus header")
 
     # ---- retry uses stored settings ----
     check(client.post(f"/api/jobs/{job}/retry", json={}).get_json().get("ok"),

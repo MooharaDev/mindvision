@@ -12,6 +12,7 @@ async function enterSettings() {
   el("set-key").value = "";
   paintKeyHint(s);
   el("set-msg").innerHTML = "";
+  paintOcr(s);
 
   let health = {};
   try { health = await api("/healthz"); } catch { /* shown as unknown below */ }
@@ -27,6 +28,45 @@ async function enterSettings() {
         "this server") +
     row("Engine", "<code>pdf2db.py</code> — the same pipeline also runs headless " +
         "from the command line for very large archives");
+}
+
+/* OCR needs a binary this server may simply not have. Rather than offer a
+   control that always fails, the panel states what is missing and how to fix
+   it — the operator is inside an air gap and cannot go and look it up. */
+function paintOcr(s) {
+  el("set-ocr").value = s.ocr_mode || "off";
+  el("set-ocr-lang").value = s.ocr_language || "eng";
+  el("set-ocr-dpi").value = s.ocr_dpi || 300;
+  const disabled = !s.ocr_available;
+  ["set-ocr", "set-ocr-lang", "set-ocr-dpi"].forEach(id => {
+    el(id).disabled = disabled;
+  });
+  el("set-ocr-msg").innerHTML = disabled
+    ? callout("warn", "<strong>Tesseract is not installed on this server</strong>, " +
+        "so scanned pages cannot be read. Ask for the <code>tesseract</code> package " +
+        "and its language data to be provisioned, then set <code>TESSDATA_PREFIX</code> " +
+        "(or <code>ocr_tessdata</code>) and restart. No model download and no network " +
+        "access is involved.")
+    : '<p class="hint">Language data found at <code>' + esc(s.ocr_tessdata) +
+      "</code>.</p>";
+}
+
+async function saveOcr() {
+  const body = { ocr_mode: el("set-ocr").value,
+                 ocr_language: el("set-ocr-lang").value,
+                 ocr_dpi: Number(el("set-ocr-dpi").value) };
+  try {
+    const s = await api("/api/settings", { method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+    settingsCache = s;
+    paintOcr(s);
+    el("set-ocr-msg").innerHTML = callout("good",
+      s.ocr_mode === "off" ? "Saved. New corpora will skip scanned pages."
+        : "Saved. New corpora default to <b>" + esc(s.ocr_mode) + "</b> OCR.");
+  } catch (e) {
+    el("set-ocr-msg").innerHTML = callout("bad", esc(e.message));
+  }
 }
 
 function paintKeyHint(s) {

@@ -34,6 +34,15 @@ No pretrained weights are needed for this tool. No test data is included —
 - `flask==3.1.3` + `waitress==3.0.2` — only for the web console (`webapp.py`)
 Everything else is Python stdlib; request them via the internal PyPI channel.
 
+**OS package channel (NOT pip), only if scanned documents must be read:**
+- `tesseract-ocr` + the language data (`tesseract-ocr-eng`, add `-ara` etc.)
+- then set `TESSDATA_PREFIX` to the directory holding the `.traineddata` files,
+  or set the `ocr_tessdata` config key.
+This is optional. With `ocr_mode="off"` (the default) nothing above is needed
+and scanned pages are reported as `no_text`, exactly as in earlier versions.
+pymupdf calls the binary in-process: no download, no model file, no network,
+and no vision/multimodal LLM anywhere in the path.
+
 ## Air-gap compliance
 - Zero outbound traffic. The only network call is the LLM endpoint YOU
   configure via `--llm-base-url`; point it at the internal gateway.
@@ -43,12 +52,15 @@ Everything else is Python stdlib; request them via the internal PyPI channel.
   ambient corporate proxy settings can never re-route LLM traffic
   (`--set llm_use_env_proxy=true` only if your gateway genuinely sits behind one).
 - No downloads, no telemetry, no runtime pip.
+- OCR, when enabled, is a local binary call. It adds no network surface.
 
 ## First run inside (suggested order)
 ```bash
 # 1. prove the plumbing works on this machine, no data or network needed:
-python pdf2db.py --selftest        # pipeline engine (27 checks)
-python webapp_selftest.py          # web console end-to-end (61 checks)
+python pdf2db.py --selftest        # pipeline engine (43 checks; OCR checks are
+                                   #   skipped with a clear note if tesseract
+                                   #   is not installed — that is not a failure)
+python webapp_selftest.py          # web console end-to-end (76 checks)
 
 # 2. inventory + text extraction only (no LLM yet) — review text_report.csv
 #    to see how many reports are scanned (low_yield) before spending LLM calls:
@@ -199,10 +211,10 @@ the same structure, for hand-editing or for the CLI.
 ```json
 {
   "table": "incidents",            // SQLite file + table naming
-  "record_unit": "folder",         // "folder": each top-level subfolder of
-                                   //   --root is one record (all its PDFs are
-                                   //   concatenated). "pdf": every PDF is its
-                                   //   own record.
+  "record_unit": "folder",         // how PDFs group into records — see the
+                                   //   grammar table below. Overridable per
+                                   //   run with --record-unit, so one schema
+                                   //   serves differently-shaped archives.
   "task_description": "context given to the LLM about what a record is",
   "fields": [
     {"name": "failure_class", "type": "enum", "required": true,
@@ -217,11 +229,61 @@ the pipeline's provenance columns (the script rejects bad schemas loudly).
 Beyond your fields, every LLM reply must include `_confidence` (0-1) and
 `_evidence` (verbatim quotes per field) — these drive the review queue.
 
+### `record_unit` grammar
+Given a PDF's path *relative to `--root`*:
+
+| Value | One record is | `2003/Q1/INC-2231/report.pdf` becomes |
+|---|---|---|
+| `pdf` | one PDF file | `2003/Q1/INC-2231/report` |
+| `folder` | the top-level subfolder | `2003` |
+| `parent` | the immediate parent folder | `2003/Q1/INC-2231` |
+| `depth:N` | the folder N segments below root | `depth:2` → `2003/Q1` |
+| `regex:PATTERN` | the first match in the path | `regex:(?P<id>INC-\d+)` → `INC-2231` |
+
+`regex:` uses the named group `id` if present, else group 1, else the whole
+match. A path that does not match still becomes its own record (nothing is
+dropped) and is logged as `no_regex_match`; a path shallower than the requested
+folder level is logged as `shallower_than_record_unit`. Bad specs (`depth:0`,
+an unclosed bracket) are rejected when the schema loads, before any work.
+
+The console scores every mode against your archive and shows record counts and
+example ids before you commit; `POST /api/staging/<id>/grouping` does the same
+for an arbitrary pattern.
+
+### Discovery and OCR config
+All settable via `--set key=value`, `--config FILE`, or the console.
+
+| Key | Default | What it does |
+|---|---|---|
+| `record_unit` | `""` | overrides the schema's value; `""` = use the schema |
+| `include_globs` | `""` | `;`-separated fnmatch patterns a path must match |
+| `exclude_globs` | `~$*;*/~$*;.*;*/.*;__MACOSX/*` | skipped outright (Office lock files, dotfiles) |
+| `max_depth` | `0` | only files at most N segments deep; 0 = no limit |
+| `max_file_mb` | `0` | skip PDFs larger than this; 0 = no limit |
+| `follow_symlinks` | `false` | walking symlinked dirs risks loops and escaping `--root` |
+| `dedupe_identical` | `true` | byte-identical PDFs **inside one record** read once; only same-size files are hashed, shortest path wins |
+| `file_order` | `path` | order within a record: `path`, `mtime` (oldest first), `size` (largest first) |
+| `extract_workers` | `1` | parallel PDFs in the extract stage; raise when OCR dominates |
+| `ocr_mode` | `off` | `off` / `auto` (pages with no text layer) / `augment` (image regions on every page, keeping digital text) / `force` (every page as an image) |
+| `ocr_language` | `eng` | tesseract codes, e.g. `eng+ara` |
+| `ocr_dpi` | `300` | rasterisation dpi; higher = slower, better on small print |
+| `ocr_tessdata` | `""` | explicit tessdata dir; `""` = autodetect via `TESSDATA_PREFIX` |
+| `ocr_page_char_threshold` | `50` | `auto`: a page with fewer native chars than this is OCR'd |
+| `ocr_max_pages_per_pdf` | `0` | cap OCR pages per document; 0 = no cap |
+
+Every enum and range above is validated **before** the run starts, so a typo
+fails in the first second rather than three hours into an archive. Setting
+`ocr_mode` without tesseract present is a startup failure, not a silent
+fallback to empty records.
+
+OCR costs roughly 1-3 s per scanned page. Check `text_report.csv`
+(`ocr_pages`, `native_chars`, `ocr_chars`) to see what it actually did.
+
 ## What comes out (all in --out)
 | Artifact | What it is |
 |---|---|
-| `pdf_inventory.csv` | every PDF found (magic-byte detection), sizes, record grouping |
-| `text_report.csv` | per-PDF pages/chars, `low_yield` scan flag, per-file errors |
+| `pdf_inventory.csv` | every PDF found (magic-byte detection), sizes, mtimes, record grouping — post-filter and post-dedupe |
+| `text_report.csv` | per-PDF pages/chars, `low_yield` scan flag, `ocr_pages`/`native_chars`/`ocr_chars`, per-file errors |
 | `records_text.csv` + `text/` | per-record concatenated text sent to the LLM |
 | `raw_llm/<record>.json` | every raw LLM attempt + validation errors (full audit) |
 | `extractions.jsonl` | validated per-record JSON (append-only; powers `--resume`; an llm run without `--resume` first backs it up to `.bak`; a line torn by an interruption is dropped and re-extracted on resume) |
@@ -243,8 +305,12 @@ before trusting the labels for anything downstream). Fill `corrected_json`,
 `reviewer`, `verdict` during review; those columns are yours.
 
 ## Known limitations (deliberate v1 scope)
-- Text-only: scanned reports (no text layer) are flagged, not OCR'd. If many
-  reports are scans, request OCR provisioning (tesseract) as a follow-up.
+- Scanned reports need `ocr_mode` on **and** the tesseract OS package. Left off,
+  they are flagged `no_text` rather than guessed at. OCR quality on 1970s-80s
+  microfiche-grade scans is untested — check `records.csv` for the `ocr_used`
+  review reason and read a sample before trusting a decade wholesale.
+- OCR reads characters, not layout: tables in scanned pages come back as loose
+  text in reading order, not as rows and columns.
 - Long documents are head+tail truncated at `max_record_chars` (default
   80 000 chars) rather than chunk-merged; truncated records are routed to
   review by default.

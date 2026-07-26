@@ -1,0 +1,20 @@
+# Provision internally before running (staged ahead of time; NO runtime pip):
+pymupdf==1.28.0
+# only needed for the web console (webapp.py); the CLI pipeline is pymupdf-only:
+flask==3.1.3
+waitress==3.0.2
+
+# ---------------------------------------------------------------------------
+# NOT a Python package — request separately from the internal OS package channel
+# ONLY if scanned documents need to be read (ocr_mode != "off"):
+#
+#   tesseract-ocr           the OCR engine binary
+#   tesseract-ocr-eng       English language data (add -ara etc. as needed)
+#
+# pymupdf calls it in-process; nothing is downloaded and no vision model is
+# involved. Leave ocr_mode="off" and none of this is required — scanned pages
+# are simply reported as no_text, exactly as before.
+# After installing, set TESSDATA_PREFIX to the directory holding *.traineddata
+# (or set the ocr_tessdata config key). The console's Settings page shows
+# whether the server found it.
+# ---------------------------------------------------------------------------

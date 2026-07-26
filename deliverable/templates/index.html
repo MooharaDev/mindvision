@@ -308,6 +308,36 @@
     </div>
 
     <div class="panel">
+      <header><div><h2>Scanned documents</h2>
+        <p class="sub">Reading pages that carry no text layer, on this server.</p></div></header>
+      <div class="body" id="ocr-body">
+        <div class="grid2">
+          <div class="field"><label for="set-ocr">Default for new corpora</label>
+            <select id="set-ocr">
+              <option value="off">Off — scans are reported as no text</option>
+              <option value="auto">Auto — read pages that have no text layer</option>
+              <option value="augment">Augment — also read text inside figures</option>
+              <option value="force">Force — read every page as an image</option>
+            </select>
+            <p class="hint">Each corpus can override this when it is created.</p></div>
+          <div class="field"><label for="set-ocr-lang">Language</label>
+            <input type="text" id="set-ocr-lang" spellcheck="false" placeholder="eng">
+            <p class="hint">Tesseract codes, joined with <code>+</code> —
+              e.g. <code>eng</code> or <code>eng+ara</code>. The matching language
+              pack must be installed on this server.</p></div>
+        </div>
+        <div class="field" style="max-width:260px"><label for="set-ocr-dpi">Resolution (dpi)</label>
+          <input type="number" id="set-ocr-dpi" min="72" max="1200" step="50">
+          <p class="hint">300 suits body text; raise it for small print, at the
+            cost of speed.</p></div>
+        <div style="display:flex;gap:var(--s3);align-items:center;margin-top:var(--s4)">
+          <button class="btn primary" onclick="saveOcr()">Save OCR settings</button>
+        </div>
+        <div id="set-ocr-msg" style="margin-top:var(--s4)"></div>
+      </div>
+    </div>
+
+    <div class="panel">
       <header><h2>About this server</h2></header>
       <div class="body"><dl class="filelist" id="about-list"></dl></div>
     </div>

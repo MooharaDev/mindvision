@@ -11,9 +11,10 @@
 const TYPES = ["string", "enum", "integer", "number", "boolean", "date"];
 
 let staging = null;        // { staging_id, scan, source }
-let chosenFiles = [];
+let chosenFiles = [];      // [{ file: File, rel: "sub/dir/name.pdf" }] from click OR drop
 let srcMode = "upload";
 let recordUnit = "folder";
+let ocrMode = "off";       // chosen on the intake step; "" is never sent
 let draftExamples = {};    // field name -> value seen in the first sample
 let draftState = null;     // null | "pending" | "done" | "skipped"
 let wizStep = 1;
@@ -59,7 +60,9 @@ function setSource(m) {
 document.addEventListener("DOMContentLoaded", () => {
   const zone = el("dropzone");
   el("files").addEventListener("change", () => {
-    chosenFiles = [...el("files").files];
+    // same shape as the drop path: the picker supplies the relative path itself
+    chosenFiles = [...el("files").files]
+      .map(f => ({ file: f, rel: f.webkitRelativePath || f.name }));
     uploadArchive();
   });
   zone.addEventListener("dragover", e => {
@@ -69,37 +72,106 @@ document.addEventListener("DOMContentLoaded", () => {
   zone.addEventListener("drop", e => {
     e.preventDefault();
     zone.classList.remove("over");
-    chosenFiles = [...e.dataTransfer.files];
-    uploadArchive();
+    /* A dropped FOLDER appears in dataTransfer.files as the directory itself,
+       not its contents — uploading that fails at the network layer. The entry
+       API is the only way to see inside. Entries must be taken synchronously:
+       the item list is invalidated as soon as this handler returns. */
+    const entries = [...e.dataTransfer.items]
+      .filter(i => i.kind === "file")
+      .map(i => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null))
+      .filter(Boolean);
+    const plain = [...e.dataTransfer.files];
+    if (!entries.length) {                     // no entry API — loose files only
+      chosenFiles = plain.map(f => ({ file: f, rel: f.name }));
+      uploadArchive();
+      return;
+    }
+    el("drop-title").textContent = "Reading folder…";
+    el("drop-note").textContent = "Listing every file before anything is sent.";
+    collectEntries(entries)
+      .then(found => {
+        if (!found.length) {
+          el("scan-msg").innerHTML = callout("bad",
+            "That folder appears to be empty.");
+          resetIntake();
+          return;
+        }
+        chosenFiles = found;
+        uploadArchive();
+      })
+      .catch(err => {
+        el("scan-msg").innerHTML = callout("bad",
+          "Could not read that folder: " + esc(err.message || String(err)) +
+          ". Use the click-to-choose option instead.");
+        resetIntake();
+      });
   });
 });
 
-function archiveName() {
-  for (const f of chosenFiles) {
-    const rel = f.webkitRelativePath || "";
-    if (rel.includes("/")) return rel.split("/")[0];
+/* Walk dropped directory entries into [{file, rel}]. readEntries() hands back
+   at most 100 children per call and signals the end with an empty array, so it
+   MUST be looped — reading it once silently truncates any folder over 100
+   files, which is exactly the kind of quiet data loss this tool exists to
+   avoid. */
+function collectEntries(entries) {
+  const out = [];
+  const walk = (entry, prefix) => new Promise((resolve, reject) => {
+    if (entry.isFile) {
+      entry.file(f => { out.push({ file: f, rel: prefix + entry.name }); resolve(); },
+                 reject);
+      return;
+    }
+    const reader = entry.createReader();
+    const batch = () => reader.readEntries(async kids => {
+      if (!kids.length) { resolve(); return; }
+      try {
+        for (const kid of kids) await walk(kid, prefix + entry.name + "/");
+      } catch (e) { reject(e); return; }
+      batch();
+    }, reject);
+    batch();
+  });
+  return Promise.all(entries.map(e => walk(e, ""))).then(() => out);
+}
+
+/* The name of the single top-level folder everything sits in, or "" when the
+   selection spans several (or is loose files / a zip). Also decides whether
+   that name gets stripped below. */
+function commonTopFolder() {
+  let top = null;
+  for (const { rel } of chosenFiles) {
+    if (!rel.includes("/")) return "";       // something sits at the very top
+    const first = rel.split("/")[0];
+    if (top === null) top = first;
+    else if (top !== first) return "";       // more than one root folder
   }
-  return chosenFiles.length === 1 ? chosenFiles[0].name.replace(/\.zip$/i, "") : "";
+  return top || "";
+}
+
+function archiveName() {
+  const top = commonTopFolder();
+  if (top) return top;
+  return chosenFiles.length === 1
+    ? chosenFiles[0].rel.replace(/\.zip$/i, "") : "";
 }
 
 async function uploadArchive() {
   if (!chosenFiles.length) return;
   let bytes = 0;
-  for (const f of chosenFiles) bytes += f.size;
+  for (const { file } of chosenFiles) bytes += file.size;
   el("dropzone").classList.remove("loaded");
   el("drop-title").textContent = "Uploading " + chosenFiles.length + " files (" +
     fmtBytes(bytes) + ")…";
   el("drop-note").textContent = "Large archives take a moment.";
   el("scan-msg").innerHTML = "";
 
+  // strip the chosen folder's OWN name so its subfolders become the records —
+  // but only when there is exactly one, or dropping two folders would merge them
+  const top = commonTopFolder();
   const fd = new FormData();
   fd.append("source_name", archiveName());
-  for (const f of chosenFiles) {
-    // drop the selected folder's own name so its subfolders become records
-    let rel = f.webkitRelativePath || f.name;
-    const parts = rel.split("/");
-    if (parts.length > 1) rel = parts.slice(1).join("/");
-    fd.append("files", f, rel);
+  for (const { file, rel } of chosenFiles) {
+    fd.append("files", file, top ? rel.slice(top.length + 1) : rel);
   }
   await sendStaging(fd);
 }
@@ -136,16 +208,20 @@ async function sendStaging(fd) {
 
 function renderScan() {
   const s = staging.scan;
-  recordUnit = s.units.folder.n_records > 1 &&
-               s.units.folder.n_records < s.units.pdf.n_records ? "folder" : "pdf";
+  recordUnit = s.suggested_unit || "folder";
   const probe = s.probe;
   const warn = [];
   if (probe.n_low_yield) {
+    const ocr = s.ocr || {};
     warn.push(callout("warn",
       "<strong>" + probe.n_low_yield + " of " + probe.n_probed +
       " sampled documents hold almost no selectable text.</strong> They are " +
-      "probably scans. The extraction model reads text only, so records like " +
-      "these are flagged <em>no text</em> instead of being guessed at."));
+      "probably scans. " + (ocr.available
+        ? "This server has Tesseract, so you can switch <b>OCR</b> on below and " +
+          "read them anyway — no model download, no network."
+        : "The extraction model reads text only, so records like these are " +
+          "flagged <em>no text</em> instead of being guessed at. To read them, " +
+          "the <code>tesseract</code> package has to be provisioned on this server.")));
   }
   if (s.truncated) {
     warn.push(callout("warn", "<strong>Very large archive.</strong> The preview " +
@@ -157,6 +233,19 @@ function renderScan() {
     warn.push(callout("", s.n_loose + " PDF" + (s.n_loose === 1 ? " sits" : "s sit") +
       " directly in the top level rather than in a subfolder. Each becomes its " +
       "own record."));
+  }
+  if (s.n_filtered) {
+    warn.push(callout("", "<b>" + fmtNum(s.n_filtered) + "</b> file" +
+      (s.n_filtered === 1 ? "" : "s") + " that look like PDFs are being skipped " +
+      "as editor lock files or hidden files (names starting <code>~$</code> or " +
+      "<code>.</code>). They are listed in <code>issues.csv</code> after the run."));
+  }
+  if (s.depth > 2 && (s.id_patterns || []).length) {
+    const p = s.id_patterns[0];
+    warn.push(callout("", "Documents are nested up to <b>" + s.depth + "</b> folders " +
+      "deep and the paths carry what looks like an identifier (" + esc(p.label) +
+      "). Grouping by that pattern would make <b>" + fmtNum(p.n_records) +
+      "</b> records — check the options below."));
   }
 
   const sample = probe.samples.find(x => x.preview) || probe.samples[0] || {};
@@ -173,12 +262,20 @@ function renderScan() {
       readout("Size", fmtBytes(s.n_bytes) + (s.truncated ? "+" : "")) +
     '</dl></div>' +
     '<div class="body rowsep">' + warn.join("") +
-      '<div class="field" style="max-width:520px;margin-bottom:0">' +
+      '<div class="field" style="max-width:560px;margin-bottom:0">' +
       '<label for="unit-pick">What should count as one record?</label>' +
-      '<select id="unit-pick" data-act-change="unit">' +
-        unitOption("folder", s) + unitOption("pdf", s) +
-      '</select>' +
+      '<select id="unit-pick">' + unitOptions(s) + '</select>' +
       '<p class="hint" id="unit-hint">' + unitHint(s) + '</p></div>' +
+      '<div class="field" id="unit-custom-wrap" hidden ' +
+           'style="max-width:560px;margin:var(--s3) 0 0">' +
+        '<label for="unit-custom">Pattern to read the identifier from each path</label>' +
+        '<input type="text" id="unit-custom" spellcheck="false" autocapitalize="off" ' +
+          'placeholder="(?P&lt;id&gt;INC-\\d+)">' +
+        '<p class="hint" id="unit-custom-hint">Every document whose path contains the ' +
+          'same match becomes one record. Name the group <code>id</code>, or use the ' +
+          'first bracketed group.</p>' +
+      '</div>' +
+      ocrPickerHtml(s) +
     '</div>' +
     (sample.preview ? '<div class="body rowsep">' +
       '<p class="micro" style="margin-bottom:8px">Text read from ' +
@@ -192,11 +289,78 @@ function renderScan() {
     '</div></div>';
 
   el("unit-pick").addEventListener("change", e => {
-    recordUnit = e.target.value;
     draftState = null;                       // a different unit needs a new draft
-    el("recordcount").innerHTML = atLeast(s.units[recordUnit].n_records);
+    const custom = e.target.value === "__custom__";
+    el("unit-custom-wrap").hidden = !custom;
+    if (custom) { el("unit-custom").focus(); previewCustomUnit(); return; }
+    recordUnit = e.target.value;
+    el("recordcount").innerHTML = atLeast(unitRecords(s, recordUnit));
     el("unit-hint").innerHTML = unitHint(s);
   });
+  el("unit-custom").addEventListener("input", () => {
+    draftState = null;
+    clearTimeout(customTimer);
+    customTimer = setTimeout(previewCustomUnit, 300);   // typing a regex is noisy
+  });
+  const ocrSel = el("ocr-pick");
+  if (ocrSel) ocrSel.addEventListener("change", e => { ocrMode = e.target.value; });
+}
+
+/* A custom pattern is scored by the server against the real paths: the count
+   and the example ids are the only honest way to know a regex did what you
+   meant before spending a run on it. */
+let customTimer = null;
+function previewCustomUnit() {
+  const raw = el("unit-custom").value.trim();
+  const hint = el("unit-custom-hint");
+  if (!raw) {
+    hint.innerHTML = "Enter a pattern — e.g. <code>(?P&lt;id&gt;INC-\\d+)</code>.";
+    hint.className = "hint";
+    return;
+  }
+  const spec = "regex:" + raw;
+  api("/api/staging/" + staging.staging_id + "/grouping",
+      { method: "POST", body: JSON.stringify({ record_unit: spec }) })
+    .then(r => {
+      recordUnit = spec;
+      el("recordcount").innerHTML = atLeast(r.n_records);
+      const ex = r.examples.filter(Boolean).slice(0, 4)
+        .map(e => "<code>" + esc(e) + "</code>").join(", ");
+      hint.className = "hint";
+      hint.innerHTML = "<b>" + fmtNum(r.n_records) + "</b> records from " +
+        fmtNum(r.n_pdfs) + " PDFs" + (ex ? " — e.g. " + ex : "") +
+        (r.n_unmatched ? ' <span class="st"><i class="dot warn"></i>' +
+          fmtNum(r.n_unmatched) + " path(s) do not match; each becomes its own " +
+          "record</span>" : "");
+    })
+    .catch(e => {
+      hint.className = "hint err";
+      hint.textContent = e.message || "that pattern is not valid";
+    });
+}
+
+function unitRecords(s, unit) {
+  return (s.units[unit] || {}).n_records
+      ?? ((s.id_patterns || []).find(p => p.record_unit === unit) || {}).n_records ?? 0;
+}
+
+function ocrPickerHtml(s) {
+  const ocr = s.ocr || {};
+  if (!ocr.available) return "";
+  ocrMode = ocr.recommended ? "auto" : (settingsCache && settingsCache.ocr_mode) || "off";
+  const opt = (v, label) => '<option value="' + v + '"' +
+    (v === ocrMode ? " selected" : "") + ">" + esc(label) + "</option>";
+  return '<div class="field" style="max-width:560px;margin:var(--s3) 0 0">' +
+    '<label for="ocr-pick">Read scanned pages with OCR?</label>' +
+    '<select id="ocr-pick">' +
+      opt("off", "No — skip scans and flag them as no text") +
+      opt("auto", "Yes — OCR pages that have no text layer (recommended)") +
+      opt("augment", "Yes — also read text inside figures on normal pages") +
+      opt("force", "Yes — OCR every page, ignoring any existing text") +
+    '</select>' +
+    '<p class="hint">Runs on this server with Tesseract. Slower — roughly a ' +
+      'second or two per scanned page — and OCR\'d records are always sent to ' +
+      'review.</p></div>';
 }
 
 function readout(label, value, id) {
@@ -211,19 +375,65 @@ function atLeast(n) {
       "+</small>" : "");
 }
 
-function unitOption(unit, s) {
-  const n = fmtNum(s.units[unit].n_records) + (s.truncated ? "+" : "");
-  const label = unit === "folder"
-    ? "One record per top-level subfolder — its PDFs are merged"
-    : "One record per PDF file";
-  return '<option value="' + unit + '"' + (unit === recordUnit ? " selected" : "") +
-         ">" + esc(label) + " (" + n + " records)</option>";
+/* Every grouping the archive supports, each labelled with the number of records
+   it would actually produce. The count is the decision, not the wording. */
+function unitLabel(unit) {
+  if (unit === "pdf") return "One record per PDF file";
+  if (unit === "folder") return "One record per top-level subfolder — its PDFs are merged";
+  if (unit === "parent") return "One record per folder of PDFs (the folder each PDF sits in)";
+  if (unit.indexOf("depth:") === 0)
+    return "One record per folder " + unit.split(":")[1] +
+           " level(s) down — everything below it merged";
+  if (unit.indexOf("regex:") === 0)
+    return "One record per identifier in the path — " + unit.slice(6);
+  return unit;
+}
+
+function unitOption(unit, s, labelOverride, nOverride) {
+  const n = fmtNum(nOverride ?? unitRecords(s, unit)) + (s.truncated ? "+" : "");
+  return '<option value="' + esc(unit) + '"' + (unit === recordUnit ? " selected" : "") +
+         ">" + esc(labelOverride || unitLabel(unit)) + " (" + n + " records)</option>";
+}
+
+function unitOptions(s) {
+  const order = ["folder", "parent", "pdf"];
+  const depths = Object.keys(s.units).filter(u => u.indexOf("depth:") === 0).sort();
+  let html = order.filter(u => s.units[u]).map(u => unitOption(u, s)).join("") +
+             depths.map(u => unitOption(u, s)).join("");
+  (s.id_patterns || []).forEach(p => {
+    html += unitOption(p.record_unit, s,
+      "One record per identifier in the path — " + p.label, p.n_records);
+  });
+  const known = recordUnit.indexOf("regex:") !== 0 ||
+                (s.id_patterns || []).some(p => p.record_unit === recordUnit);
+  html += '<option value="__custom__"' + (known ? "" : " selected") +
+          ">Custom pattern…</option>";
+  return html;
+}
+
+/* The schema step repeats the picker without the custom-pattern editor: a
+   grouping typed on step 1 (or loaded from a saved schema) still has to appear
+   here, so it is carried in as its own option rather than silently reset. */
+function unitOptionsFor(s, current) {
+  let html = unitOptions(s).replace(
+    /<option value="__custom__"[^>]*>[^<]*<\/option>/, "");
+  if (current && html.indexOf('value="' + esc(current) + '"') === -1) {
+    html += '<option value="' + esc(current) + '" selected>' +
+            esc(unitLabel(current)) + "</option>";
+  }
+  return html;
 }
 
 function unitHint(s) {
-  const ex = s.units[recordUnit].examples;
-  return ex.length ? "Records would be: " + ex.slice(0, 4).map(e =>
-    "<code>" + esc(e) + "</code>").join(", ") + (ex.length > 4 ? " …" : "") : "";
+  const u = s.units[recordUnit] ||
+            (s.id_patterns || []).find(p => p.record_unit === recordUnit);
+  const ex = (u && u.examples) || [];
+  const unmatched = u && u.n_unmatched
+    ? ' <span class="st"><i class="dot warn"></i>' + fmtNum(u.n_unmatched) +
+      " PDF(s) sit above this level and become their own record</span>" : "";
+  return (ex.length ? "Records would be: " + ex.slice(0, 4).map(e =>
+    "<code>" + esc(e) + "</code>").join(", ") + (ex.length > 4 ? " …" : "") : "") +
+    unmatched;
 }
 
 onAct("reset-intake", () => {
@@ -236,8 +446,7 @@ onAct("to-schema", () => wizGoto(2));
 /* ======================= step 2: the schema ======================= */
 function autoDraft() {
   if (!staging) { wizGoto(1); return; }
-  el("s-unit").innerHTML = unitOption("folder", staging.scan) +
-                           unitOption("pdf", staging.scan);
+  el("s-unit").innerHTML = unitOptionsFor(staging.scan, recordUnit);
   el("s-unit").value = recordUnit;
   unitChanged();
   if (settingsCache && settingsCache.is_mock) {
@@ -468,6 +677,10 @@ async function startBuild() {
   fd.append("staging_id", staging.staging_id);
   fd.append("schema", JSON.stringify(schema));
   fd.append("title", staging.source || schema.table);
+  // how the archive is READ travels with the run, not with the schema, so the
+  // same schema can be pointed at a differently-shaped archive later
+  fd.append("record_unit", recordUnit);
+  fd.append("ocr_mode", ocrMode);
   const btn = el("build-btn");
   busy(btn, true);
   let j;
