@@ -39,6 +39,8 @@ function fmtBytes(n) {
 const fmtNum = n => (n === null || n === undefined || n === "") ? "—"
   : Number(n).toLocaleString("en-US");
 
+const plural = (n, one, many) => (n === 1 ? one : (many || one + "s"));
+
 function icon(name, size) {
   return '<svg width="' + (size || 15) + '" height="' + (size || 15) +
          '" aria-hidden="true"><use href="#i-' + name + '"/></svg>';
@@ -144,15 +146,23 @@ function openDrawerHTML(title, bodyHTML, footHTML, navHTML) {
   el("drawer-nav").innerHTML = navHTML || "";
   el("drawer-foot").innerHTML = footHTML || "";
   el("drawer-foot").hidden = !footHTML;
-  el("drawer").classList.add("open");
+  const d = el("drawer");
+  // closed, the drawer is only translated off-screen — without these two
+  // attributes a screen reader still lands in an empty modal dialog
+  d.inert = false;
+  d.removeAttribute("aria-hidden");
+  d.classList.add("open");
   el("scrim").classList.add("open");
   el("drawer-body").scrollTop = 0;
   el("drawer-close").focus();
 }
 
 function closeDrawer() {
-  if (!el("drawer").classList.contains("open")) return;
-  el("drawer").classList.remove("open");
+  const d = el("drawer");
+  if (!d.classList.contains("open")) return;
+  d.classList.remove("open");
+  d.setAttribute("aria-hidden", "true");
+  d.inert = true;
   el("scrim").classList.remove("open");
   if (drawerOpener && drawerOpener.isConnected && drawerOpener.focus) drawerOpener.focus();
   drawerOpener = null;

@@ -108,20 +108,22 @@
 
     <div class="panel">
       <header style="gap:var(--s2)">
-        <div class="seg" id="c-tabs" role="tablist">
-          <button role="tab" data-tab="records" aria-pressed="true"
+        <!-- toggle buttons, not ARIA tabs: there is no tabpanel/aria-selected
+             wiring, and aria-pressed alone is the honest contract -->
+        <div class="seg" id="c-tabs">
+          <button data-tab="records" aria-pressed="true"
                   onclick="pickTab('records')">Records</button>
-          <button role="tab" data-tab="review_queue" aria-pressed="false"
+          <button data-tab="review_queue" aria-pressed="false"
                   onclick="pickTab('review_queue')">Review</button>
-          <button role="tab" data-tab="images" aria-pressed="false"
+          <button data-tab="images" aria-pressed="false"
                   onclick="pickTab('images')">Images</button>
-          <button role="tab" data-tab="pdfs" aria-pressed="false"
+          <button data-tab="pdfs" aria-pressed="false"
                   onclick="pickTab('pdfs')">Documents</button>
-          <button role="tab" data-tab="issues" aria-pressed="false"
+          <button data-tab="issues" aria-pressed="false"
                   onclick="pickTab('issues')">Issues</button>
-          <button role="tab" data-tab="overview" aria-pressed="false"
+          <button data-tab="overview" aria-pressed="false"
                   onclick="pickTab('overview')">Overview</button>
-          <button role="tab" data-tab="export" aria-pressed="false"
+          <button data-tab="export" aria-pressed="false"
                   onclick="pickTab('export')">Export</button>
         </div>
         <div class="searchbox" id="c-searchbox" style="width:230px;margin-left:auto">
@@ -321,7 +323,8 @@
 </div><!-- /shell -->
 
 <div id="scrim" onclick="closeDrawer()"></div>
-<aside id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+<aside id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"
+       aria-hidden="true" inert>
   <header>
     <h3 id="drawer-title">Record</h3>
     <div class="btnrow" id="drawer-nav"></div>

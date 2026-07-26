@@ -30,7 +30,7 @@ function wizGoto(n) {
     el("wiz-" + i).hidden = i !== n;
     el("step-" + i).dataset.state = i < n ? "done" : i === n ? "on" : "";
   }
-  if (n === 2 && draftState === null) autoDraft();
+  if (n === 2 && draftState === null) prepareSchemaStep();
 }
 
 function resetIntake() {
@@ -444,7 +444,10 @@ onAct("reset-intake", () => {
 onAct("to-schema", () => wizGoto(2));
 
 /* ======================= step 2: the schema ======================= */
-function autoDraft() {
+/* The schema starts EMPTY. Drafting is opt-in: nothing is read or sent to the
+   model until the operator clicks the suggest button — arriving on this step
+   must never cost an LLM call by itself. */
+function prepareSchemaStep() {
   if (!staging) { wizGoto(1); return; }
   el("s-unit").innerHTML = unitOptionsFor(staging.scan, recordUnit);
   el("s-unit").value = recordUnit;
@@ -462,8 +465,21 @@ function autoDraft() {
     if (!el("s-fields").children.length) { addField(); addField(); addField(); }
     return;
   }
-  draftSchema();
+  draftState = "offer";
+  el("draft-panel").innerHTML = callout("",
+      "<strong>Build the table by hand, or let the model draft it.</strong> " +
+      "Suggesting a schema samples up to 3 of your documents and sends their " +
+      "text to " + esc((settingsCache && settingsCache.llm_model) || "the model") +
+      "; nothing has been sent yet.") +
+    '<div class="btnrow" style="margin-bottom:var(--s5)">' +
+    '<button class="btn primary" data-act="suggest-schema">' + icon("draft", 14) +
+    "Suggest a schema from the documents</button>" +
+    '<button class="btn" data-act="load-example">Load the example schema' +
+    "</button></div>";
+  if (!el("s-fields").children.length) { addField(); addField(); addField(); }
 }
+
+onAct("suggest-schema", () => draftSchema());
 
 async function draftSchema() {
   draftState = "pending";
@@ -526,22 +542,29 @@ function unitChanged() {
 }
 
 /* ---------- schema editor ---------- */
+let fieldSeq = 0;
 function addField(f) {
   f = f || { name: "", type: "string", required: false, options: "", description: "" };
   const row = document.createElement("div");
   row.className = "fieldrow";
   const ex = draftExamples[f.name];
+  const seq = ++fieldSeq;
   row.innerHTML =
-    '<div><input type="text" class="f-name" spellcheck="false" aria-label="Field name" ' +
+    '<div><input type="text" class="f-name" name="f-name-' + seq +
+      '" spellcheck="false" aria-label="Field name" ' +
       'placeholder="field_name" value="' + esc(f.name) + '"></div>' +
-    '<div><select class="f-type" aria-label="Field type" data-act-type="1">' +
+    '<div><select class="f-type" name="f-type-' + seq +
+      '" aria-label="Field type" data-act-type="1">' +
       TYPES.map(t => '<option' + (t === f.type ? " selected" : "") + ">" + t +
         "</option>").join("") + "</select></div>" +
-    '<div class="req"><input type="checkbox" class="f-req" aria-label="Required"' +
+    '<div class="req"><input type="checkbox" class="f-req" name="f-req-' + seq +
+      '" aria-label="Required"' +
       (f.required ? " checked" : "") + "></div>" +
-    '<div><input type="text" class="f-desc" aria-label="What to extract" ' +
+    '<div><input type="text" class="f-desc" name="f-desc-' + seq +
+      '" aria-label="What to extract" ' +
       'placeholder="What should the model look for?" value="' + esc(f.description) + '">' +
-      '<input type="text" class="f-opts" aria-label="Allowed values" ' +
+      '<input type="text" class="f-opts" name="f-opts-' + seq +
+      '" aria-label="Allowed values" ' +
       'style="margin-top:6px' + (f.type === "enum" ? "" : ";display:none") + '" ' +
       'placeholder="allowed, values, comma separated" value="' + esc(f.options) + '"></div>' +
     '<div><button class="iconbtn dangerous" data-act="drop-field" ' +
@@ -740,6 +763,7 @@ async function pollBuild() {
 
   if (j.status === "running") return;
   clearInterval(pollTimer);
+  loadLedger();   // the rail's corpora tally now includes this run
   if (j.status === "failed") {
     el("build-result").innerHTML =
       callout("bad", "<strong>The run failed.</strong> " + esc(j.error || "")) +

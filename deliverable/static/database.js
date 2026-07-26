@@ -37,8 +37,10 @@ function renderLedger() {
     debt += s.n_review_queue || 0;
   }
   el("ledger-sub").innerHTML = ledgerJobs.length
-    ? fmtNum(ledgerJobs.length) + " corpora · " + fmtNum(recs) +
-      " records extracted from " + fmtNum(docs) + " documents · " +
+    ? fmtNum(ledgerJobs.length) + " " +
+      plural(ledgerJobs.length, "corpus", "corpora") + " · " + fmtNum(recs) +
+      " " + plural(recs, "record") + " extracted from " + fmtNum(docs) +
+      " " + plural(docs, "document") + " · " +
       (debt ? '<b class="num">' + fmtNum(debt) + "</b> awaiting review"
             : "nothing awaiting review")
     : "Every database built from an archive of documents.";
@@ -102,6 +104,10 @@ const PIPELINE_COLS = ["source_paths", "n_pdfs", "n_pages", "chars_extracted",
   "llm_attempts", "extracted_at", "n_images", "_evidence", "_notes"];
 
 async function openCorpus(id, tab) {
+  // an unknown tab in the hash (mistyped/stale link) would highlight nothing
+  // and ask the server for a table that does not exist
+  if (!TABLE_TABS.includes(tab) && tab !== "overview" && tab !== "export")
+    tab = "records";
   const fresh = id !== cid;
   cid = id;
   ctab = tab;
@@ -576,18 +582,20 @@ async function openRecord(recordId, forceEdit) {
       input = '<div class="v' + (v === "" ? " none" : "") + '">' +
               esc(v === "" ? "—" : v) + "</div>";
     } else if (f.type === "enum") {
-      input = '<div class="v"><select class="rv" data-f="' + esc(f.name) + '">' +
+      input = '<div class="v"><select class="rv" name="rv-' + esc(f.name) +
+        '" data-f="' + esc(f.name) + '">' +
         '<option value="">— none —</option>' +
         (f.options || []).map(o => "<option" + (String(o) === String(v) ? " selected" : "") +
           ">" + esc(o) + "</option>").join("") + "</select></div>";
     } else if (f.type === "boolean") {
-      input = '<div class="v"><select class="rv" data-f="' + esc(f.name) + '">' +
+      input = '<div class="v"><select class="rv" name="rv-' + esc(f.name) +
+        '" data-f="' + esc(f.name) + '">' +
         ["", "True", "False"].map(o => '<option value="' + o + '"' +
           (o === String(v) ? " selected" : "") + ">" + (o || "— none —") +
           "</option>").join("") + "</select></div>";
     } else {
-      input = '<div class="v"><input type="text" class="rv" data-f="' + esc(f.name) +
-        '" value="' + esc(v) + '"></div>';
+      input = '<div class="v"><input type="text" class="rv" name="rv-' + esc(f.name) +
+        '" data-f="' + esc(f.name) + '" value="' + esc(v) + '"></div>';
     }
     return '<div class="k">' + esc(f.name) + (f.required ? " *" : "") + "</div>" +
       input + (q ? '<p class="quote" style="margin-top:6px">' + esc(q) + "</p>" : "");
