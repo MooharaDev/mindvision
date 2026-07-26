@@ -1,0 +1,56 @@
+{
+  "table": "incidents",
+  "record_unit": "folder",
+  "task_description": "Each record is one material-failure incident report from a plant/refinery archive (Material Consulting Services). The document may mix report prose, lab analysis, and figure captions. Extract what the report itself states; never infer beyond the text. NOTE: the failure_class option list below is a PLACEHOLDER — replace it with the empirical top-5 classes once a first extraction pass over the real archive establishes class frequencies.",
+  "fields": [
+    {
+      "name": "incident_number",
+      "type": "string",
+      "required": false,
+      "description": "The incident/report reference number as printed in the report (e.g. 'INC-1234', lab report no.). Null if not printed."
+    },
+    {
+      "name": "failure_class",
+      "type": "enum",
+      "required": true,
+      "options": ["corrosion", "cracking", "erosion", "mechanical_damage", "weld_defect", "other"],
+      "description": "The primary failure type concluded by the report. Use 'other' when the concluded mechanism fits none of the listed classes."
+    },
+    {
+      "name": "failure_mechanism_verbatim",
+      "type": "string",
+      "required": false,
+      "description": "The report's own wording for the failure mechanism/mode, verbatim (e.g. 'chloride stress corrosion cracking', 'CO2 corrosion', 'sulfidation')."
+    },
+    {
+      "name": "material",
+      "type": "string",
+      "required": false,
+      "description": "Material of the failed component as stated (e.g. 'carbon steel A106 Gr B', '316L SS')."
+    },
+    {
+      "name": "component",
+      "type": "string",
+      "required": false,
+      "description": "The failed equipment/component (e.g. 'heat exchanger tube', '6-inch pipeline elbow')."
+    },
+    {
+      "name": "incident_date",
+      "type": "date",
+      "required": false,
+      "description": "Date of the failure/incident (not the report issue date) as stated; ISO YYYY[-MM[-DD]]."
+    },
+    {
+      "name": "has_micrographs",
+      "type": "boolean",
+      "required": false,
+      "description": "True if the report text refers to metallographic/SEM micrographs or magnifications (e.g. '500X', 'SEM image')."
+    },
+    {
+      "name": "summary",
+      "type": "string",
+      "required": false,
+      "description": "One to three sentences summarizing what failed and how, in plain words drawn from the report."
+    }
+  ]
+}

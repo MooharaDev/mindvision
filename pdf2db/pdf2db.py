@@ -1,0 +1,1434 @@
+#!/usr/bin/env python3
+"""
+pdf2db.py — general-purpose, schema-driven PDF -> database extraction pipeline.
+
+Point it at ANY directory tree containing PDFs (any folder layout, any file
+naming — PDFs are detected by magic bytes, not names), give it a schema file
+describing the fields you want, and it:
+
+  1. discover : inventories every PDF under --root (recursive, deterministic)
+  2. extract  : pulls text per PDF (pymupdf), flags probable scans (low text
+                yield), concatenates per record, writes text artifacts
+  3. llm      : sends each record's text + the schema to an OpenAI-compatible
+                LLM endpoint (e.g. an internal/intranet deployment) which
+                returns one validated JSON object per record; invalid replies
+                get a bounded repair loop; every raw response is logged
+  4. load     : builds a SQLite database (+ CSV exports of every table),
+                including a human review queue (low confidence, null required
+                fields, scan-suspect, truncated, seeded random audit sample)
+
+AIR-GAP SAFE: python stdlib + pymupdf only. The ONLY network traffic is the
+LLM endpoint you configure (set it to your internal gateway; set it to "mock"
+for a fully offline deterministic stand-in). No downloads, no telemetry.
+No pretrained-weights file is needed for this script.
+
+Run:
+  python pdf2db.py --root ARCHIVE_DIR --schema schemas/failure_reports.json \
+      --out out/ --llm-base-url http://internal-gw:8000/v1 --llm-model NAME
+  python pdf2db.py --selftest        # offline end-to-end test, no inputs needed
+
+Every stage reads/writes flat auditable artifacts in --out:
+  pdf_inventory.csv, text_report.csv, records_text.csv, text/<record>.txt,
+  raw_llm/<record>.json, extractions.jsonl, issues.csv,
+  <table>.db, records.csv, pdfs.csv, review_queue.csv, run_summary.json
+"""
+
+import argparse
+import concurrent.futures
+import csv
+from collections import Counter
+import hashlib
+import json
+import os
+import re
+import ssl
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+try:
+    import pymupdf  # pymupdf >= 1.24 module name
+except ImportError:  # older installs expose only the legacy name
+    import fitz as pymupdf
+
+# --------------------------------------------------------------------------
+# CONFIG — every knob lives here; override via --config FILE and/or --set k=v
+# --------------------------------------------------------------------------
+CONFIG = {
+    # paths
+    "root": "",                     # archive root directory (required unless --selftest)
+    "schema": "",                   # schema JSON file (required unless --selftest)
+    "out": "out",                   # output directory
+    # discovery
+    "sniff_all_files": True,        # detect PDFs by %PDF- magic in ANY file, regardless of name
+    # text extraction
+    "scan_chars_per_page": 200,     # below this avg chars/page a PDF is flagged low_yield (probable scan)
+    "min_record_chars": 300,        # records with less usable text than this are status=no_text
+    "max_record_chars": 80000,      # truncate longer concatenated text (head+tail) before the LLM
+    "truncate_head_frac": 0.7,      # fraction of the budget spent on the head; rest on the tail
+    # image extraction (for the vision phase: images link to records by record_id)
+    "extract_images": True,         # export embedded PDF images + catalog loose image files
+    "image_min_px": 64,             # skip embedded images smaller than this on either side
+    "image_min_bytes": 1024,        # skip embedded images smaller than this (logos, rules)
+    # llm endpoint (OpenAI-compatible /chat/completions). "mock" = offline deterministic stand-in.
+    "llm_base_url": "mock",
+    "llm_model": "internal-model",
+    "llm_api_key": "",              # discouraged; prefer the env var below
+    "llm_api_key_env": "PDF2DB_API_KEY",
+    "llm_temperature": 0.0,
+    "llm_force_json": False,        # send response_format={"type":"json_object"} (not all gateways support it)
+    "llm_use_env_proxy": False,     # False = ignore http_proxy/HTTPS_PROXY env vars (air-gap default)
+    "llm_ca_file": "",              # custom CA bundle for an HTTPS gateway with a private CA
+    "llm_workers": 4,               # parallel LLM requests (1 = strictly sequential)
+    "llm_timeout_s": 180,
+    "llm_transport_retries": 3,
+    "llm_retry_backoff_s": 2.0,
+    "llm_validation_retries": 2,    # extra attempts when the reply fails schema validation
+    "llm_sleep_between_calls_s": 0.0,
+    "log_full_prompts": False,      # if True, raw_llm/ logs include full prompt text (large)
+    # mock behaviour (selftest uses this)
+    "mock_fail_first_attempt": False,  # first mock reply per record is broken, to exercise the repair loop
+    # review routing
+    "review_confidence_threshold": 0.7,
+    "review_on_truncation": True,
+    "review_sample_rate": 0.08,     # seeded random audit sample of otherwise-ok records
+    "seed": 0,
+    # run control
+    "stages": "discover,extract,images,llm,load",
+    "resume": False,                # keep prior extractions.jsonl; skip records already extracted ok
+    "limit": 0,                     # >0: only send the first N pending records to the LLM (smoke runs)
+}
+
+RESERVED_COLUMNS = {
+    "record_id", "source_paths", "n_pdfs", "n_pages", "chars_extracted",
+    "truncated", "low_yield", "scanned_suspect", "status", "review_reasons",
+    "llm_model", "llm_attempts", "extracted_at", "n_images",
+    "_confidence", "_evidence", "_notes",
+}
+IMG_MAGICS = [(b"\x89PNG", "png"), (b"\xff\xd8\xff", "jpg"), (b"GIF8", "gif"),
+              (b"II*\x00", "tif"), (b"MM\x00*", "tif"), (b"BM", "bmp")]
+FIELD_TYPES = {"string", "integer", "number", "boolean", "enum", "date"}
+IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+DATE_RE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+SQL_TYPE = {"string": "TEXT", "date": "TEXT", "enum": "TEXT",
+            "integer": "INTEGER", "number": "REAL", "boolean": "INTEGER"}
+
+
+def log(msg):
+    print(f"[pdf2db] {msg}", flush=True)
+
+
+def die(msg):
+    print(f"[pdf2db] FATAL: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_csv(path, rows, fieldnames):
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in fieldnames})
+
+
+def read_csv(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def require_artifact(path, stage, hint):
+    """Fail with a clear operator message when a prerequisite artifact is
+    missing (e.g. running --stages llm,load in a fresh --out directory)."""
+    if not Path(path).exists():
+        die(f"{stage}: required artifact {path} is missing — {hint}")
+
+
+def read_jsonl_tolerant(path, what):
+    """Read a .jsonl file, tolerating a truncated FINAL line (interrupted run).
+    Returns (rows, truncated_final_line). A corrupt NON-final line aborts with
+    the exact location — that is damage worth a human look, not auto-repair."""
+    rows, truncated = [], False
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            if i == len(lines) - 1:
+                log(f"WARNING: last line of {path} is truncated (interrupted run?) — "
+                    f"ignored; that record will be re-extracted")
+                truncated = True
+            else:
+                die(f"{what}: corrupt JSON at {path} line {i + 1}: {e}")
+    return rows, truncated
+
+
+def safe_filename(record_id):
+    """Deterministic collision-proof filename for a record id."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", record_id)[:80]
+    digest = hashlib.sha1(record_id.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}"
+
+
+# --------------------------------------------------------------------------
+# Schema
+# --------------------------------------------------------------------------
+def validate_schema(schema):
+    """Validate (and normalize in place) a schema dict. Returns a list of
+    error strings — empty when valid. Safe to call from other tools (webapp)."""
+    errs = []
+    table = schema.get("table", "")
+    if not IDENT_RE.match(table or ""):
+        errs.append(f"table {table!r} must match {IDENT_RE.pattern}")
+    if schema.get("record_unit", "folder") not in ("folder", "pdf"):
+        errs.append("record_unit must be 'folder' or 'pdf'")
+    schema.setdefault("record_unit", "folder")
+    schema.setdefault("task_description", "")
+    fields = schema.get("fields") or []
+    if not fields:
+        errs.append("schema needs a non-empty 'fields' list")
+    seen = set()
+    for f in fields:
+        name = f.get("name", "")
+        if not IDENT_RE.match(name):
+            errs.append(f"field name {name!r} must match {IDENT_RE.pattern}")
+        if name in RESERVED_COLUMNS:
+            errs.append(f"field name {name!r} is reserved for pipeline columns")
+        if name in seen:
+            errs.append(f"duplicate field name {name!r}")
+        seen.add(name)
+        if f.get("type") not in FIELD_TYPES:
+            errs.append(f"field {name!r}: type must be one of {sorted(FIELD_TYPES)}")
+        if f.get("type") == "enum" and not f.get("options"):
+            errs.append(f"enum field {name!r} needs non-empty 'options'")
+        f.setdefault("required", False)
+        f.setdefault("description", "")
+    return errs
+
+
+def load_schema(path):
+    with open(path, encoding="utf-8") as fh:
+        schema = json.load(fh)
+    errs = validate_schema(schema)
+    if errs:
+        die("invalid schema:\n  - " + "\n  - ".join(errs))
+    return schema
+
+
+def _progress(cfg, stage, done=0, total=0):
+    """Optional progress hook: set cfg['_progress_cb'] to a callable to get
+    (stage, done, total) updates. Used by webapp.py; no-op from the CLI."""
+    cb = cfg.get("_progress_cb")
+    if cb:
+        cb(stage, done, total)
+
+
+# --------------------------------------------------------------------------
+# Stage 1: discover
+# --------------------------------------------------------------------------
+def assign_record_id(rel_path, record_unit):
+    parts = rel_path.split("/")
+    if record_unit == "pdf" or len(parts) == 1:
+        rid = rel_path
+        if rid.lower().endswith(".pdf"):
+            rid = rid[:-4]
+        return rid, (record_unit == "folder")   # (id, loose_root_pdf_in_folder_mode)
+    return parts[0], False
+
+
+def stage_discover(cfg, schema, outdir, issues):
+    root = Path(cfg["root"]).resolve()
+    if not root.is_dir():
+        die(f"--root {root} is not a directory")
+    inventory, n_ignored = [], 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            p = Path(dirpath) / fn
+            rel = p.relative_to(root).as_posix()
+            try:
+                with open(p, "rb") as fh:
+                    magic = fh.read(5)
+            except OSError as e:
+                issues.append({"severity": "error", "stage": "discover", "rel_path": rel,
+                               "record_id": "", "reason": "unreadable_file", "detail": str(e)[:300]})
+                continue
+            is_pdf = magic == b"%PDF-"
+            has_pdf_ext = p.suffix.lower() == ".pdf"
+            if not is_pdf:
+                if has_pdf_ext:
+                    rid, _ = assign_record_id(rel, schema["record_unit"])
+                    issues.append({"severity": "error", "stage": "discover", "rel_path": rel,
+                                   "record_id": rid, "reason": "pdf_extension_but_not_pdf",
+                                   "detail": f"magic bytes {magic!r}; if its folder has no other "
+                                             f"PDFs, this record exists ONLY in issues.csv"})
+                else:
+                    n_ignored += 1  # images etc. — expected, not an issue
+                continue
+            if not has_pdf_ext and not cfg["sniff_all_files"]:
+                n_ignored += 1
+                continue
+            rid, loose = assign_record_id(rel, schema["record_unit"])
+            if loose:
+                issues.append({"severity": "warning", "stage": "discover", "rel_path": rel,
+                               "record_id": rid, "reason": "loose_pdf_in_root",
+                               "detail": "record_unit=folder but PDF sits directly in root; "
+                                         "it becomes its own record"})
+            inventory.append({"record_id": rid, "rel_path": rel,
+                              "size_bytes": p.stat().st_size, "had_pdf_ext": int(has_pdf_ext)})
+    inventory.sort(key=lambda r: (r["record_id"], r["rel_path"]))
+    write_csv(outdir / "pdf_inventory.csv", inventory,
+              ["record_id", "rel_path", "size_bytes", "had_pdf_ext"])
+    log(f"discover: {len(inventory)} PDFs across "
+        f"{len({r['record_id'] for r in inventory})} records; {n_ignored} non-PDF files ignored")
+    return inventory
+
+
+# --------------------------------------------------------------------------
+# Stage 2: extract text
+# --------------------------------------------------------------------------
+def extract_pdf_text(path):
+    """Returns (page_texts, error). error is None on success."""
+    try:
+        doc = pymupdf.open(path)
+    except Exception as e:  # pymupdf raises several types; one file must not kill the run
+        return None, f"open_error:{type(e).__name__}: {str(e)[:200]}"
+    try:
+        if doc.is_encrypted and not doc.authenticate(""):
+            return None, "encrypted"
+        pages = []
+        for page in doc:
+            pages.append(page.get_text("text"))
+        return pages, None
+    except Exception as e:
+        return None, f"read_error:{type(e).__name__}: {str(e)[:200]}"
+    finally:
+        doc.close()
+
+
+def truncate_text(text, max_chars, head_frac):
+    if len(text) <= max_chars:
+        return text, False
+    head = int(max_chars * head_frac)
+    tail = max_chars - head
+    omitted = len(text) - head - tail
+    return (text[:head] + f"\n\n[... TRUNCATED: {omitted} characters omitted ...]\n\n"
+            + text[-tail:]), True
+
+
+def stage_extract(cfg, schema, outdir, issues):
+    require_artifact(outdir / "pdf_inventory.csv", "extract",
+                     "run the discover stage into this --out first")
+    root = Path(cfg["root"]).resolve()
+    inventory = read_csv(outdir / "pdf_inventory.csv")
+    textdir = outdir / "text"
+    textdir.mkdir(exist_ok=True)
+    by_record = {}
+    for row in inventory:
+        by_record.setdefault(row["record_id"], []).append(row)
+
+    pdf_rows, record_rows = [], []
+    for rid in sorted(by_record):
+        chunks, tot_pages, tot_chars, n_ok = [], 0, 0, 0
+        any_low_yield = False
+        for row in sorted(by_record[rid], key=lambda r: r["rel_path"]):
+            rel = row["rel_path"]
+            pages, err = extract_pdf_text(root / rel)
+            if err is not None:
+                reason = err.split(":", 1)[0]
+                issues.append({"severity": "error", "stage": "extract", "rel_path": rel,
+                               "record_id": rid, "reason": reason, "detail": err})
+                pdf_rows.append({"record_id": rid, "rel_path": rel, "n_pages": 0,
+                                 "chars": 0, "chars_per_page": 0.0, "low_yield": 0, "error": err})
+                continue
+            chars = sum(len(t) for t in pages)
+            cpp = round(chars / len(pages), 1) if pages else 0.0
+            low = int(len(pages) > 0 and cpp < cfg["scan_chars_per_page"])
+            any_low_yield = any_low_yield or bool(low)
+            pdf_rows.append({"record_id": rid, "rel_path": rel, "n_pages": len(pages),
+                             "chars": chars, "chars_per_page": cpp, "low_yield": low, "error": ""})
+            chunks.append(f"===== FILE: {rel} =====\n" + "".join(pages))
+            tot_pages += len(pages)
+            tot_chars += chars
+            n_ok += 1
+        text = "\n\n".join(chunks)
+        text, truncated = truncate_text(text, cfg["max_record_chars"], cfg["truncate_head_frac"])
+        fname = safe_filename(rid) + ".txt"
+        with open(textdir / fname, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        record_rows.append({
+            "record_id": rid, "n_pdfs": len(by_record[rid]), "n_pdfs_readable": n_ok,
+            "n_pages": tot_pages, "chars": tot_chars, "truncated": int(truncated),
+            "scanned_suspect": int(any_low_yield),
+            "usable": int(tot_chars >= cfg["min_record_chars"]),
+            "text_file": f"text/{fname}",
+            "source_paths": ";".join(sorted(r["rel_path"] for r in by_record[rid])),
+        })
+    write_csv(outdir / "text_report.csv", pdf_rows,
+              ["record_id", "rel_path", "n_pages", "chars", "chars_per_page", "low_yield", "error"])
+    write_csv(outdir / "records_text.csv", record_rows,
+              ["record_id", "n_pdfs", "n_pdfs_readable", "n_pages", "chars", "truncated",
+               "scanned_suspect", "usable", "text_file", "source_paths"])
+    n_unusable = sum(1 for r in record_rows if not r["usable"])
+    log(f"extract: {len(record_rows)} records; {n_unusable} below min_record_chars "
+        f"({cfg['min_record_chars']}); {sum(r['scanned_suspect'] for r in record_rows)} scan-suspect")
+    return record_rows
+
+
+# --------------------------------------------------------------------------
+# Stage 2b: images — export embedded PDF images + catalog loose image files.
+# Every image row carries record_id, so images join to extracted labels for
+# the vision phase; `modality` is reserved (filled later by human/model).
+# --------------------------------------------------------------------------
+IMAGES_FIELDS = ["image_id", "record_id", "source", "origin", "page",
+                 "file", "width", "height", "bytes", "format", "modality"]
+
+
+def stage_images(cfg, schema, outdir, issues):
+    imgs_csv = outdir / "images.csv"
+    if not cfg["extract_images"]:
+        write_csv(imgs_csv, [], IMAGES_FIELDS)
+        log("images: skipped (extract_images=false)")
+        return []
+    require_artifact(outdir / "pdf_inventory.csv", "images",
+                     "run the discover stage first")
+    root = Path(cfg["root"]).resolve()
+    imgdir = outdir / "images"
+    imgdir.mkdir(exist_ok=True)
+    rows = []
+
+    # 1. images embedded inside the PDFs
+    for row in sorted(read_csv(outdir / "pdf_inventory.csv"),
+                      key=lambda r: (r["record_id"], r["rel_path"])):
+        rid, rel = row["record_id"], row["rel_path"]
+        try:
+            doc = pymupdf.open(root / rel)
+            if doc.is_encrypted and not doc.authenticate(""):
+                doc.close()
+                continue  # already reported by the extract stage
+            seen = set()
+            for pno in range(doc.page_count):
+                for info in doc.get_page_images(pno, full=True):
+                    xref = info[0]
+                    if xref in seen:
+                        continue
+                    seen.add(xref)
+                    try:
+                        img = doc.extract_image(xref)
+                    except Exception:  # damaged/unsupported object — skip it
+                        continue
+                    w, h = img.get("width", 0), img.get("height", 0)
+                    data = img.get("image", b"")
+                    if (w < cfg["image_min_px"] or h < cfg["image_min_px"]
+                            or len(data) < cfg["image_min_bytes"]):
+                        continue
+                    sub = imgdir / safe_filename(rid)
+                    sub.mkdir(exist_ok=True)
+                    ext = img.get("ext", "png")
+                    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(rel).stem)[:60]
+                    fname = f"{stem}_p{pno + 1}_x{xref}.{ext}"
+                    (sub / fname).write_bytes(data)
+                    rows.append({"record_id": rid, "source": "embedded",
+                                 "origin": rel, "page": pno + 1,
+                                 "file": f"images/{safe_filename(rid)}/{fname}",
+                                 "width": w, "height": h, "bytes": len(data),
+                                 "format": ext, "modality": ""})
+            doc.close()
+        except Exception as e:  # one bad PDF must not kill the stage
+            issues.append({"severity": "warning", "stage": "images",
+                           "rel_path": rel, "record_id": rid,
+                           "reason": "image_extract_error",
+                           "detail": f"{type(e).__name__}: {str(e)[:200]}"})
+
+    # 2. loose image files (jpeg/png/tif/...) sitting beside the PDFs.
+    #    These are catalogued in place, never copied. Ownership: the record id
+    #    a loose file's own path implies is only meaningful in folder mode — in
+    #    pdf mode every record is named after a PDF, so an image next to it
+    #    would resolve to a record that does not exist. When the implied id is
+    #    not a real record, fall back to the PDFs sharing the image's folder,
+    #    and only claim ownership when exactly one PDF sits there. Anything
+    #    ambiguous is reported in issues.csv with an empty record_id rather
+    #    than guessed at.
+    inventory = read_csv(outdir / "pdf_inventory.csv")
+    known_ids = {r["record_id"] for r in inventory}
+    ids_by_dir = {}
+    for r in inventory:
+        ids_by_dir.setdefault(str(PurePosixPath(r["rel_path"]).parent),
+                              set()).add(r["record_id"])
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            p = Path(dirpath) / fn
+            rel = p.relative_to(root).as_posix()
+            try:
+                with open(p, "rb") as fh:
+                    head = fh.read(8)
+            except OSError:
+                continue  # unreadable files are reported by discover
+            fmt = next((f for m, f in IMG_MAGICS if head.startswith(m)), None)
+            if fmt is None:
+                continue
+            rid, _ = assign_record_id(rel, schema["record_unit"])
+            if rid not in known_ids:
+                owners = ids_by_dir.get(str(PurePosixPath(rel).parent), set())
+                if len(owners) == 1:
+                    rid = next(iter(owners))
+                else:
+                    issues.append({
+                        "severity": "warning", "stage": "images",
+                        "rel_path": rel, "record_id": "",
+                        "reason": "image_owner_unresolved",
+                        "detail": f"{len(owners)} PDFs share this image's folder"
+                                  f"{' (' + ', '.join(sorted(owners)[:3]) + ')' if owners else ''}"
+                                  " — the image is catalogued but joins to no "
+                                  "record; move it beside a single PDF or use "
+                                  "record_unit=folder"})
+                    rid = ""
+            w = h = 0
+            try:
+                pm = pymupdf.Pixmap(str(p))
+                w, h = pm.width, pm.height
+            except Exception:  # pymupdf raises FzError* — catalog it anyway
+                pass  # dimensions stay unknown (0)
+            rows.append({"record_id": rid, "source": "loose", "origin": rel,
+                         "page": "", "file": "", "width": w, "height": h,
+                         "bytes": p.stat().st_size, "format": fmt,
+                         "modality": ""})
+
+    rows.sort(key=lambda r: (r["record_id"], r["source"], r["origin"],
+                             str(r["page"])))
+    for i, r in enumerate(rows, 1):
+        r["image_id"] = f"img-{i:06d}"
+    write_csv(imgs_csv, rows, IMAGES_FIELDS)
+    n_emb = sum(1 for r in rows if r["source"] == "embedded")
+    log(f"images: {len(rows)} catalogued ({n_emb} embedded exported, "
+        f"{len(rows) - n_emb} loose files)")
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Stage 3: LLM extraction
+# --------------------------------------------------------------------------
+class LLMTransportError(Exception):
+    pass
+
+
+def build_prompts(schema, record_id, text):
+    lines = []
+    for f in schema["fields"]:
+        req = "required" if f["required"] else "optional"
+        opts = f" Allowed values: {json.dumps(f['options'])}." if f["type"] == "enum" else ""
+        lines.append(f'- "{f["name"]}" ({f["type"]}; {req}): {f["description"]}{opts}')
+    system = ("You are a precise data-extraction engine. "
+              "Output exactly one JSON object and nothing else — no markdown fences, no commentary.")
+    user = f"""Task: extract structured fields from the document below.
+{schema['task_description']}
+
+Return a JSON object with exactly these keys:
+{chr(10).join(lines)}
+- "_confidence" (number; required): overall confidence 0.0-1.0 that the extracted values are correct.
+- "_evidence" (object; required): maps field names to short VERBATIM quotes from the document \
+supporting the value; include an entry for every field you filled; use {{}} if none.
+- "_notes" (string; optional): anything ambiguous or noteworthy.
+
+Rules:
+- Use null for any field the document does not support. Never guess.
+- Enum fields: use exactly one of the allowed values, or null.
+- Dates: ISO format (YYYY-MM-DD, or YYYY-MM / YYYY if the document is less precise).
+- The document may concatenate several files; "===== FILE: ... =====" lines mark boundaries.
+- A "[... TRUNCATED ...]" marker means middle content was omitted for length.
+
+DOCUMENT (id: {record_id}):
+<<<BEGIN DOCUMENT
+{text}
+END DOCUMENT>>>"""
+    return system, user
+
+
+def parse_json_response(raw):
+    s = raw.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end <= start:
+        return None, "response contains no JSON object"
+    try:
+        obj = json.loads(s[start:end + 1])
+    except json.JSONDecodeError as e:
+        return None, f"response is not valid JSON: {e}"
+    if not isinstance(obj, dict):
+        return None, "response JSON is not an object"
+    return obj, None
+
+
+def _coerce(f, value, errors, warnings):
+    """Type-check/coerce one schema field value. Returns possibly-coerced value."""
+    name, ftype = f["name"], f["type"]
+    if value is None:
+        return None
+    if ftype == "string":
+        if not isinstance(value, str):
+            warnings.append(f"{name}: coerced {type(value).__name__} to string")
+            return str(value)
+        return value
+    if ftype == "integer":
+        if isinstance(value, bool):
+            errors.append(f"{name}: expected integer, got boolean")
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+            warnings.append(f"{name}: coerced string to integer")
+            return int(value.strip())
+        errors.append(f"{name}: expected integer, got {value!r}")
+        return None
+    if ftype == "number":
+        if isinstance(value, bool):
+            errors.append(f"{name}: expected number, got boolean")
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                warnings.append(f"{name}: coerced string to number")
+                return float(value.strip())
+            except ValueError:
+                pass
+        errors.append(f"{name}: expected number, got {value!r}")
+        return None
+    if ftype == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            warnings.append(f"{name}: coerced string to boolean")
+            return value.strip().lower() == "true"
+        errors.append(f"{name}: expected boolean, got {value!r}")
+        return None
+    if ftype == "enum":
+        if not isinstance(value, str):
+            errors.append(f"{name}: enum value must be a string, got {type(value).__name__}")
+            return None
+        if value in f["options"]:
+            return value
+        lowered = {o.lower(): o for o in f["options"]}
+        if value.lower() in lowered:
+            warnings.append(f"{name}: case-corrected enum value {value!r}")
+            return lowered[value.lower()]
+        errors.append(f"{name}: {value!r} is not one of {f['options']}")
+        return None
+    if ftype == "date":
+        if not isinstance(value, str):
+            errors.append(f"{name}: date must be a string, got {type(value).__name__}")
+            return None
+        if not DATE_RE.match(value.strip()):
+            warnings.append(f"{name}: date {value!r} not ISO (YYYY[-MM[-DD]]); kept as-is")
+        return value.strip()
+    errors.append(f"{name}: unhandled type {ftype}")  # unreachable if schema validated
+    return None
+
+
+def validate_and_coerce(schema, obj, text):
+    errors, warnings = [], []
+    clean = {}
+    known = {f["name"] for f in schema["fields"]}
+    for key in obj:
+        if key not in known and key not in ("_confidence", "_evidence", "_notes"):
+            warnings.append(f"unknown key {key!r} dropped")
+    for f in schema["fields"]:
+        name = f["name"]
+        if name not in obj:
+            errors.append(f"missing key {name!r} (use null if the document does not support it)")
+            continue
+        clean[name] = _coerce(f, obj[name], errors, warnings)
+    conf = obj.get("_confidence")
+    if isinstance(conf, str):
+        try:
+            conf = float(conf)
+        except ValueError:
+            conf = None
+    if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not 0.0 <= float(conf) <= 1.0:
+        errors.append('missing or invalid "_confidence" (number between 0 and 1)')
+    else:
+        clean["_confidence"] = float(conf)
+    ev = obj.get("_evidence")
+    if not isinstance(ev, dict):
+        errors.append('missing or invalid "_evidence" (object mapping field names to quotes)')
+    else:
+        norm_text = " ".join(text.split())
+        for k, q in ev.items():
+            if isinstance(q, str) and q and " ".join(q.split()) not in norm_text:
+                warnings.append(f"evidence for {k!r} is not a verbatim quote")
+        clean["_evidence"] = json.dumps(ev, ensure_ascii=False, sort_keys=True)
+    notes = obj.get("_notes")
+    clean["_notes"] = notes if isinstance(notes, str) else None
+    return errors, warnings, clean
+
+
+def mock_llm_response(cfg, schema, record_id, text, attempt):
+    """Deterministic offline stand-in for the internal LLM (also used by --selftest)."""
+    if cfg["mock_fail_first_attempt"] and attempt == 0:
+        return 'Sure! Here is the JSON you asked for: {"broken": '
+    def h(s):
+        return int(hashlib.sha256(f"{record_id}:{s}".encode()).hexdigest(), 16)
+    obj = {}
+    ev = {}
+    quote = text[:60].strip()
+    for f in schema["fields"]:
+        n, t = f["name"], f["type"]
+        if t == "enum":
+            obj[n] = f["options"][h(n) % len(f["options"])]
+        elif t == "integer":
+            obj[n] = h(n) % 100
+        elif t == "number":
+            obj[n] = round((h(n) % 1000) / 10.0, 1)
+        elif t == "boolean":
+            obj[n] = h(n) % 2 == 0
+        elif t == "date":
+            obj[n] = f"{1970 + h(n) % 56}-01-15"
+        else:
+            obj[n] = f"MOCK {n} {h(n) % 1000}"
+        if quote:
+            ev[n] = quote
+    obj["_confidence"] = round(min(0.95, max(0.15, len(text) / 4000.0)), 2)
+    obj["_evidence"] = ev
+    obj["_notes"] = "mock backend"
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def call_openai_compat(cfg, messages):
+    url = cfg["llm_base_url"].rstrip("/") + "/chat/completions"
+    payload = {"model": cfg["llm_model"], "messages": messages,
+               "temperature": cfg["llm_temperature"]}
+    if cfg["llm_force_json"]:
+        payload["response_format"] = {"type": "json_object"}
+    # explicit User-Agent: python-urllib's default gets blocked by bot filters
+    # (e.g. Cloudflare error 1010) in front of some OpenAI-compatible providers
+    headers = {"Content-Type": "application/json", "User-Agent": "pdf2db/1.0"}
+    key = os.environ.get(cfg["llm_api_key_env"] or "", "") or cfg["llm_api_key"]
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    handlers = [] if cfg["llm_use_env_proxy"] else \
+        [urllib.request.ProxyHandler({})]  # ambient proxies must never re-route
+    if cfg.get("llm_ca_file"):  # HTTPS gateway signed by an internal/private CA
+        ctx = ssl.create_default_context(cafile=cfg["llm_ca_file"])
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
+    last_err = "no attempt made"
+    for i in range(cfg["llm_transport_retries"]):
+        delay = cfg["llm_retry_backoff_s"] * (2 ** i)
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                         headers=headers, method="POST")
+            with opener.open(req, timeout=cfg["llm_timeout_s"]) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            return body["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read()[:500]
+            except OSError:
+                detail = b""
+            last_err = f"HTTP {e.code}: {detail!r}"
+            if e.code in (400, 401, 403, 404, 422):
+                break  # config problem; retrying will not help
+            if e.code == 429:  # rate limited — honor the server's Retry-After
+                ra = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    delay = max(delay, min(float(ra), 60.0))
+                except (TypeError, ValueError):
+                    pass
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = f"{type(e).__name__}: {e}"
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            last_err = f"unexpected response shape: {type(e).__name__}: {e}"
+        time.sleep(delay)
+    raise LLMTransportError(last_err)
+
+
+def extract_record(cfg, schema, record_id, text):
+    """Returns (clean_data_or_None, warnings, attempts_log, fail_reason_or_None)."""
+    system, user = build_prompts(schema, record_id, text)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    attempts = []
+    for attempt in range(cfg["llm_validation_retries"] + 1):
+        if cfg["llm_base_url"] == "mock":
+            raw = mock_llm_response(cfg, schema, record_id, text, attempt)
+        else:
+            try:
+                raw = call_openai_compat(cfg, messages)
+            except LLMTransportError as e:
+                attempts.append({"attempt": attempt, "error": f"transport: {e}"})
+                return None, [], attempts, f"transport: {e}"
+        obj, perr = parse_json_response(raw)
+        if perr:
+            errors, warnings, clean = [perr], [], None
+        else:
+            errors, warnings, clean = validate_and_coerce(schema, obj, text)
+        attempts.append({"attempt": attempt, "response": raw,
+                         "errors": errors, "warnings": warnings})
+        if not errors:
+            return clean, warnings, attempts, None
+        repair = ("Your previous response failed validation with these errors:\n- "
+                  + "\n- ".join(errors)
+                  + "\nReturn the corrected JSON object only — no commentary.")
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({"role": "user", "content": repair})
+    return None, [], attempts, "validation failed after retries: " + "; ".join(attempts[-1]["errors"])
+
+
+def stage_llm(cfg, schema, outdir, issues):
+    require_artifact(outdir / "records_text.csv", "llm",
+                     "run the discover+extract stages into this --out first")
+    records = read_csv(outdir / "records_text.csv")
+    rawdir = outdir / "raw_llm"
+    rawdir.mkdir(exist_ok=True)
+    jl_path = outdir / "extractions.jsonl"
+    done = {}
+    if jl_path.exists():
+        if cfg["resume"]:
+            rows, truncated = read_jsonl_tolerant(jl_path, "resume")
+            for row in rows:
+                done[row["record_id"]] = row["status"]
+            if truncated:  # drop the torn line so the file stays parseable after we append
+                with open(jl_path, "w", encoding="utf-8") as fh:
+                    for row in rows:
+                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        elif jl_path.stat().st_size > 0:
+            bak = Path(str(jl_path) + ".bak")
+            bak.write_bytes(jl_path.read_bytes())
+            log(f"WARNING: prior {jl_path.name} saved to {bak.name} — "
+                f"running the llm stage without --resume starts extraction over")
+    mode = "a" if cfg["resume"] else "w"
+    todo, n_skipped = [], 0
+    for r in sorted(records, key=lambda r: r["record_id"]):
+        if not int(r["usable"]):
+            continue  # load stage will mark it no_text
+        if done.get(r["record_id"]) == "ok":
+            n_skipped += 1
+            continue
+        todo.append(r)
+    if cfg["limit"] and len(todo) > cfg["limit"]:
+        log(f"llm: --limit {cfg['limit']}: {len(todo) - cfg['limit']} records stay pending_llm")
+        todo = todo[:cfg["limit"]]
+    n_sent = n_ok = n_failed = 0
+    _progress(cfg, "llm", 0, len(todo))
+
+    def _process(r):
+        """Worker: LLM round-trips only. All file writes stay on the main
+        thread so artifacts can never interleave."""
+        rid = r["record_id"]
+        with open(outdir / r["text_file"], encoding="utf-8") as fh:
+            text = fh.read()
+        clean, warnings, attempts, fail = extract_record(cfg, schema, rid, text)
+        return r, text, clean, warnings, attempts, fail
+
+    workers = max(1, int(cfg["llm_workers"]))
+    with open(jl_path, mode, encoding="utf-8") as out:
+        def _emit(i, r, text, clean, warnings, attempts, fail):
+            nonlocal n_ok, n_failed
+            rid = r["record_id"]
+            rawlog = {"record_id": rid, "model": cfg["llm_model"],
+                      "chars_sent": len(text), "attempts": attempts}
+            if cfg["log_full_prompts"]:
+                sys_p, user_p = build_prompts(schema, rid, text)
+                rawlog["system_prompt"], rawlog["user_prompt"] = sys_p, user_p
+            with open(rawdir / (safe_filename(rid) + ".json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(rawlog, fh, ensure_ascii=False, indent=1)
+            if clean is None:
+                status = "llm_failed" if (fail or "").startswith("transport") \
+                    else "validation_failed"
+                issues.append({"severity": "error", "stage": "llm",
+                               "rel_path": r["text_file"], "record_id": rid,
+                               "reason": status, "detail": (fail or "")[:300]})
+                out.write(json.dumps({"record_id": rid, "status": status,
+                                      "data": None, "warnings": [], "error": fail,
+                                      "attempts": len(attempts),
+                                      "model": cfg["llm_model"],
+                                      "extracted_at": now_iso()},
+                                     ensure_ascii=False) + "\n")
+                n_failed += 1
+            else:
+                out.write(json.dumps({"record_id": rid, "status": "ok",
+                                      "data": clean, "warnings": warnings,
+                                      "error": None, "attempts": len(attempts),
+                                      "model": cfg["llm_model"],
+                                      "extracted_at": now_iso()},
+                                     ensure_ascii=False) + "\n")
+                n_ok += 1
+            log(f"llm [{i}/{len(todo)}] {rid}: "
+                f"{'ok' if clean is not None else 'FAILED'} (attempts={len(attempts)})")
+            _progress(cfg, "llm", i, len(todo))
+            out.flush()
+
+        if workers == 1:
+            for i, r in enumerate(todo, 1):
+                n_sent += 1
+                res = _process(r)
+                _emit(i, res[0], res[1], res[2], res[3], res[4], res[5])
+                if cfg["llm_sleep_between_calls_s"]:
+                    time.sleep(cfg["llm_sleep_between_calls_s"])
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(_process, r) for r in todo]
+                n_sent = len(futures)
+                for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                    res = fut.result()
+                    _emit(i, res[0], res[1], res[2], res[3], res[4], res[5])
+    log(f"llm: sent {n_sent} records ({n_ok} ok, {n_failed} failed, "
+        f"{n_skipped} resumed-skip, workers={workers})")
+
+
+# --------------------------------------------------------------------------
+# Stage 4: load into SQLite + CSV exports + review queue
+# --------------------------------------------------------------------------
+def in_audit_sample(cfg, record_id):
+    h = int(hashlib.sha256(f"{cfg['seed']}:{record_id}".encode()).hexdigest(), 16)
+    return (h % 10000) < cfg["review_sample_rate"] * 10000
+
+
+def stage_load(cfg, schema, outdir, issues):
+    require_artifact(outdir / "records_text.csv", "load",
+                     "run the discover+extract stages into this --out first")
+    records_text = {r["record_id"]: r for r in read_csv(outdir / "records_text.csv")}
+    inventory = read_csv(outdir / "pdf_inventory.csv")
+    pdf_rows = read_csv(outdir / "text_report.csv")
+    size_by_path = {r["rel_path"]: r["size_bytes"] for r in inventory}
+    for p in pdf_rows:
+        p["size_bytes"] = size_by_path.get(p["rel_path"], "")
+    extractions = {}
+    jl_path = outdir / "extractions.jsonl"
+    if jl_path.exists():
+        rows, _truncated = read_jsonl_tolerant(jl_path, "load")
+        for row in rows:
+            extractions[row["record_id"]] = row  # later lines win (resume appends)
+    images = read_csv(outdir / "images.csv") if (outdir / "images.csv").exists() else []
+    n_images_by_record = Counter(i["record_id"] for i in images)
+
+    field_names = [f["name"] for f in schema["fields"]]
+    required = {f["name"] for f in schema["fields"] if f["required"]}
+    out_rows, review_rows = [], []
+    for rid in sorted(records_text):
+        rt = records_text[rid]
+        ex = extractions.get(rid)
+        row = {name: None for name in field_names}
+        row.update({
+            "record_id": rid,
+            "_confidence": None, "_evidence": None, "_notes": None,
+            "source_paths": rt["source_paths"], "n_pdfs": int(rt["n_pdfs"]),
+            "n_images": n_images_by_record.get(rid, 0),
+            "n_pages": int(rt["n_pages"]), "chars_extracted": int(rt["chars"]),
+            "truncated": int(rt["truncated"]), "scanned_suspect": int(rt["scanned_suspect"]),
+            "llm_model": None, "llm_attempts": None, "extracted_at": None,
+        })
+        reasons = []
+        if not int(rt["usable"]):
+            status = "no_text"
+            reasons.append("below_min_record_chars")
+        elif ex is None:
+            status = "pending_llm"
+        elif ex["status"] != "ok":
+            status = ex["status"]
+            row["llm_model"], row["llm_attempts"] = ex["model"], ex["attempts"]
+            row["extracted_at"] = ex["extracted_at"]
+        else:
+            data = ex["data"]
+            for name in field_names:
+                row[name] = data.get(name)
+            row["_confidence"] = data.get("_confidence")
+            row["_evidence"] = data.get("_evidence")
+            row["_notes"] = data.get("_notes")
+            row["llm_model"], row["llm_attempts"] = ex["model"], ex["attempts"]
+            row["extracted_at"] = ex["extracted_at"]
+            if row["_confidence"] is not None and row["_confidence"] < cfg["review_confidence_threshold"]:
+                reasons.append("low_confidence")
+            null_req = sorted(n for n in required if data.get(n) is None)
+            if null_req:
+                reasons.append("required_null:" + ",".join(null_req))
+            if int(rt["scanned_suspect"]):
+                reasons.append("scanned_suspect")
+            if cfg["review_on_truncation"] and int(rt["truncated"]):
+                reasons.append("truncated")
+            if not reasons and in_audit_sample(cfg, rid):
+                reasons.append("random_audit")
+            status = "needs_review" if reasons else "ok"
+        row["status"] = status
+        row["review_reasons"] = ";".join(reasons)
+        out_rows.append(row)
+        if status == "needs_review":
+            review_rows.append({
+                "record_id": rid, "review_reasons": row["review_reasons"],
+                "_confidence": row["_confidence"], "_evidence": row["_evidence"],
+                "text_file": rt["text_file"],
+                "extracted_json": json.dumps({n: row[n] for n in field_names},
+                                             ensure_ascii=False, sort_keys=True),
+                "corrected_json": "", "reviewer": "", "verdict": "",
+            })
+
+    # ---- SQLite ----
+    db_path = outdir / f"{schema['table']}.db"
+    con = sqlite3.connect(db_path)
+    try:
+        cur = con.cursor()
+        for t in ("records", "pdfs", "review_queue", "images"):
+            cur.execute(f'DROP TABLE IF EXISTS "{t}"')
+        rec_cols = (['"record_id" TEXT PRIMARY KEY']
+                    + [f'"{f["name"]}" {SQL_TYPE[f["type"]]}' for f in schema["fields"]]
+                    + ['"_confidence" REAL', '"_evidence" TEXT', '"_notes" TEXT',
+                       '"source_paths" TEXT', '"n_pdfs" INTEGER',
+                       '"n_images" INTEGER', '"n_pages" INTEGER',
+                       '"chars_extracted" INTEGER', '"truncated" INTEGER',
+                       '"scanned_suspect" INTEGER', '"status" TEXT', '"review_reasons" TEXT',
+                       '"llm_model" TEXT', '"llm_attempts" INTEGER', '"extracted_at" TEXT'])
+        cur.execute(f'CREATE TABLE "records" ({", ".join(rec_cols)})')
+        rec_fieldnames = (["record_id"] + field_names
+                          + ["_confidence", "_evidence", "_notes", "source_paths", "n_pdfs",
+                             "n_images", "n_pages", "chars_extracted", "truncated",
+                             "scanned_suspect", "status", "review_reasons", "llm_model",
+                             "llm_attempts", "extracted_at"])
+        placeholders = ", ".join("?" for _ in rec_fieldnames)
+        quoted = ", ".join(f'"{c}"' for c in rec_fieldnames)
+        for row in out_rows:
+            vals = [row[c] if not isinstance(row[c], bool) else int(row[c])
+                    for c in rec_fieldnames]
+            cur.execute(f'INSERT INTO "records" ({quoted}) VALUES ({placeholders})', vals)
+        cur.execute('CREATE TABLE "pdfs" ("record_id" TEXT '
+                    'REFERENCES "records"("record_id"), "rel_path" TEXT, '
+                    '"size_bytes" INTEGER, "n_pages" INTEGER, "chars" INTEGER, '
+                    '"chars_per_page" REAL, "low_yield" INTEGER, "error" TEXT)')
+        for p in pdf_rows:
+            cur.execute('INSERT INTO "pdfs" VALUES (?,?,?,?,?,?,?,?)',
+                        [p["record_id"], p["rel_path"], p["size_bytes"] or None, p["n_pages"],
+                         p["chars"], p["chars_per_page"], p["low_yield"], p["error"]])
+        # images table: a declared foreign key to records — this is the link
+        # the vision phase trains on (label columns live on records). An image
+        # whose owning record could not be resolved is stored with a NULL
+        # record_id so the key stays honest instead of pointing nowhere.
+        cur.execute('CREATE TABLE "images" ("image_id" TEXT PRIMARY KEY, '
+                    '"record_id" TEXT REFERENCES "records"("record_id"), '
+                    '"source" TEXT, "origin" TEXT, '
+                    '"page" INTEGER, "file" TEXT, "width" INTEGER, '
+                    '"height" INTEGER, "bytes" INTEGER, "format" TEXT, '
+                    '"modality" TEXT)')
+        for im in images:
+            cur.execute('INSERT INTO "images" VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                        [im["image_id"], im["record_id"] or None, im["source"],
+                         im["origin"], int(im["page"]) if im["page"] else None,
+                         im["file"], int(im["width"] or 0), int(im["height"] or 0),
+                         int(im["bytes"] or 0), im["format"], im["modality"]])
+        rq_cols = ["record_id", "review_reasons", "_confidence", "_evidence", "text_file",
+                   "extracted_json", "corrected_json", "reviewer", "verdict"]
+        cur.execute('CREATE TABLE "review_queue" ("record_id" TEXT '
+                    'REFERENCES "records"("record_id"), '
+                    + ", ".join(f'"{c}" TEXT' for c in rq_cols[1:]) + ")")
+        for r in review_rows:
+            cur.execute(f'INSERT INTO "review_queue" VALUES ({", ".join("?" for _ in rq_cols)})',
+                        [r[c] for c in rq_cols])
+        # indexes for the joins and filters this database exists to serve:
+        # images/pdfs/review rows by record, and records by status (the
+        # review-queue filter). Dropping a table drops its indexes, so these
+        # are simply recreated on every load.
+        cur.execute('CREATE INDEX "ix_images_record" ON "images"("record_id")')
+        cur.execute('CREATE INDEX "ix_pdfs_record" ON "pdfs"("record_id")')
+        cur.execute('CREATE INDEX "ix_review_record" ON "review_queue"("record_id")')
+        cur.execute('CREATE INDEX "ix_records_status" ON "records"("status")')
+        con.commit()
+    finally:
+        con.close()
+
+    # ---- CSV exports ----
+    write_csv(outdir / "records.csv", out_rows, rec_fieldnames)
+    write_csv(outdir / "pdfs.csv", pdf_rows,
+              ["record_id", "rel_path", "size_bytes", "n_pages", "chars", "chars_per_page",
+               "low_yield", "error"])
+    write_csv(outdir / "review_queue.csv", review_rows, rq_cols)
+
+    counts = {}
+    for row in out_rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    summary = {
+        "finished_at": now_iso(),
+        "table": schema["table"], "record_unit": schema["record_unit"],
+        "n_records": len(out_rows), "n_pdfs": len(pdf_rows),
+        "status_counts": dict(sorted(counts.items())),
+        "n_review_queue": len(review_rows),
+        "n_issues": len(issues),
+        "config": {k: v for k, v in cfg.items()
+                   if k != "llm_api_key" and not k.startswith("_")},
+    }
+    with open(outdir / "run_summary.json", "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False)
+    log(f"load: {len(out_rows)} records -> {db_path.name}; statuses {summary['status_counts']}; "
+        f"{len(review_rows)} in review queue")
+    return summary
+
+
+# --------------------------------------------------------------------------
+# Pipeline driver
+# --------------------------------------------------------------------------
+def run_pipeline(cfg):
+    schema = load_schema(cfg["schema"])
+    outdir = Path(cfg["out"])
+    outdir.mkdir(parents=True, exist_ok=True)
+    issues = []
+    stages = [s.strip() for s in cfg["stages"].split(",") if s.strip()]
+    unknown = set(stages) - {"discover", "extract", "images", "llm", "load"}
+    if unknown:
+        die(f"unknown stages: {sorted(unknown)}")
+    if "discover" in stages:
+        _progress(cfg, "discover")
+        stage_discover(cfg, schema, outdir, issues)
+    if "extract" in stages:
+        _progress(cfg, "extract")
+        stage_extract(cfg, schema, outdir, issues)
+    if "images" in stages:
+        _progress(cfg, "images")
+        stage_images(cfg, schema, outdir, issues)
+    if "llm" in stages:
+        stage_llm(cfg, schema, outdir, issues)
+    if "load" in stages:
+        _progress(cfg, "load")
+        summary = stage_load(cfg, schema, outdir, issues)
+    else:
+        summary = None
+    _progress(cfg, "finished")
+    # merge: keep issue rows from stages NOT re-run in this invocation, so split-stage
+    # workflows (--stages discover,extract now; llm,load later) never lose the record
+    issues_path = outdir / "issues.csv"
+    preserved = []
+    if issues_path.exists():
+        preserved = [r for r in read_csv(issues_path) if r.get("stage") not in set(stages)]
+    all_issues = preserved + issues
+    write_csv(issues_path, all_issues,
+              ["severity", "stage", "rel_path", "record_id", "reason", "detail"])
+    if all_issues:
+        log(f"ATTENTION: {len(all_issues)} issues in issues.csv "
+            f"({sum(1 for i in all_issues if i['severity'] == 'error')} errors)")
+    return summary
+
+
+# --------------------------------------------------------------------------
+# Selftest — fabricates a tiny synthetic archive, runs everything offline
+# --------------------------------------------------------------------------
+SELFTEST_SCHEMA = {
+    "table": "test_records",
+    "record_unit": "folder",
+    "task_description": "Each record is a small synthetic test document.",
+    "fields": [
+        {"name": "title", "type": "string", "required": True, "description": "Document title."},
+        {"name": "category", "type": "enum", "required": True,
+         "options": ["alpha", "beta", "gamma"], "description": "Test category."},
+        {"name": "year", "type": "integer", "required": False, "description": "Year mentioned."},
+        {"name": "approved", "type": "boolean", "required": False, "description": "Approval flag."},
+        {"name": "event_date", "type": "date", "required": False, "description": "Event date."},
+    ],
+}
+
+
+def _make_pdf(path, text, pages=None):
+    doc = pymupdf.open()
+    chunks = pages if pages is not None else [text[i:i + 1500] for i in range(0, len(text), 1500)] or [""]
+    for chunk in chunks:
+        page = doc.new_page()
+        if chunk:
+            page.insert_textbox(pymupdf.Rect(36, 36, 559, 806), chunk, fontsize=9)
+    doc.save(path)
+    doc.close()
+
+
+def _make_encrypted_pdf(path):
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_textbox(pymupdf.Rect(36, 36, 559, 806), "secret content " * 50, fontsize=9)
+    doc.save(path, encryption=pymupdf.PDF_ENCRYPT_AES_256, owner_pw="owner", user_pw="secret")
+    doc.close()
+
+
+def build_synthetic_archive(root):
+    root = Path(root)
+    filler = ("The quick brown fox jumps over the lazy dog near the riverbank while "
+              "engineers document every observation in meticulous detail. ")
+    # A: normal folder, one PDF with rich text (odd filename + uppercase ext), plus a loose PNG
+    a = root / "Folder A (2021)"
+    a.mkdir(parents=True)
+    _make_pdf(a / "Final REPORT v2 (copy).PDF", "Incident summary. " + filler * 40)  # ~4.7k chars
+    (a / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\nfakeimagedata")
+    # B: two PDFs, one extensionless (magic-byte discovery test)
+    b = root / "B_multi"
+    b.mkdir()
+    _make_pdf(b / "part1.pdf", "Part one of the record. " + filler * 15)
+    _make_pdf(b / "part2_no_ext", "Part two continues. " + filler * 15)
+    (b / "part2_no_ext").rename(b / "notes")  # no extension at all
+    # C: scan-like PDF — pages with no extractable text
+    c = root / "C_scanned"
+    c.mkdir()
+    _make_pdf(c / "old_scan.pdf", "", pages=["", "", ""])
+    # D: short text -> low mock confidence -> needs_review
+    d = root / "D_short"
+    d.mkdir()
+    _make_pdf(d / "brief.pdf", "A short memo about the beta category test. " + filler * 3)  # ~450 chars
+    # E: file with .pdf extension that is not a PDF
+    e = root / "E_fake"
+    e.mkdir()
+    (e / "scam.pdf").write_text("This is just a text file pretending.", encoding="utf-8")
+    # F: encrypted PDF
+    f = root / "F_locked"
+    f.mkdir()
+    _make_encrypted_pdf(f / "locked.pdf")
+    # G: PDF with an embedded image + a loose real PNG (images stage test)
+    g = root / "G_images"
+    g.mkdir()
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_textbox(pymupdf.Rect(36, 36, 559, 400),
+                        "Report with figures. " + filler * 8, fontsize=9)
+    pm = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 96, 96))
+    pm.clear_with(120)
+    page.insert_image(pymupdf.Rect(50, 420, 250, 620), stream=pm.tobytes("png"))
+    doc.save(g / "figures.pdf")
+    doc.close()
+    (g / "site_photo.png").write_bytes(pm.tobytes("png"))
+    # loose PDF directly in root (folder mode edge case)
+    _make_pdf(root / "loose_report.pdf", "Loose report at root level. " + filler * 30)
+
+
+def selftest(base_cfg):
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="pdf2db_selftest_"))
+    log(f"selftest: working in {tmp}")
+    archive = tmp / "archive"
+    build_synthetic_archive(archive)
+    schema_path = tmp / "schema.json"
+    with open(schema_path, "w", encoding="utf-8") as fh:
+        json.dump(SELFTEST_SCHEMA, fh)
+
+    failures = []
+
+    def check(cond, label):
+        (log(f"  PASS {label}") if cond else failures.append(label))
+        if not cond:
+            log(f"  FAIL {label}")
+
+    def run_once(outdir):
+        cfg = dict(base_cfg)
+        cfg.update({"root": str(archive), "schema": str(schema_path), "out": str(outdir),
+                    "llm_base_url": "mock", "mock_fail_first_attempt": True,
+                    "stages": "discover,extract,images,llm,load", "resume": False, "limit": 0,
+                    "seed": 0, "review_sample_rate": 0.25,
+                    "llm_workers": 3, "image_min_bytes": 100})
+        return run_pipeline(cfg), cfg
+
+    cfg = run_once(tmp / "out1")[1]
+    out = tmp / "out1"
+    records = {r["record_id"]: r for r in read_csv(out / "records.csv")}
+    issues = read_csv(out / "issues.csv")
+    reasons = {r["record_id"]: r["review_reasons"] for r in records.values()}
+
+    check(len(records) == 7, f"7 records found (got {sorted(records)})")
+    check(records.get("B_multi", {}).get("n_pdfs") == "2",
+          "extensionless PDF discovered by magic bytes (B_multi has 2 PDFs)")
+    check(records.get("Folder A (2021)", {}).get("status") == "ok"
+          or "random_audit" in reasons.get("Folder A (2021)", ""),
+          "rich-text record extracted ok (or only random_audit)")
+    check(records.get("C_scanned", {}).get("status") == "no_text",
+          "scan-like record flagged no_text")
+    check(records.get("D_short", {}).get("status") == "needs_review"
+          and "low_confidence" in reasons.get("D_short", ""),
+          "short record routed to review for low_confidence")
+    check(records.get("F_locked", {}).get("status") == "no_text",
+          "encrypted-PDF record ends up no_text")
+    check(any(i["reason"] == "encrypted" for i in issues), "encrypted PDF logged in issues.csv")
+    check(any(i["reason"] == "pdf_extension_but_not_pdf" for i in issues),
+          "fake .pdf logged in issues.csv")
+    check(any(i["reason"] == "loose_pdf_in_root" for i in issues),
+          "loose root PDF warning logged")
+    ok_rec = records.get("Folder A (2021)", {})
+    check(ok_rec.get("llm_attempts") == "2",
+          "repair loop exercised (2 attempts after broken first reply)")
+    check(ok_rec.get("category") in SELFTEST_SCHEMA["fields"][1]["options"],
+          "enum value valid in records.csv")
+    # images stage: embedded image exported + loose PNG catalogued, linked by record_id
+    imgs = read_csv(out / "images.csv")
+    g_imgs = [i for i in imgs if i["record_id"] == "G_images"]
+    check(any(i["source"] == "embedded" and i["file"] for i in g_imgs),
+          "embedded PDF image exported and catalogued")
+    check(any(i["source"] == "loose" and i["origin"].endswith("site_photo.png")
+              for i in g_imgs), "loose PNG catalogued for its record")
+    emb = next(i for i in g_imgs if i["source"] == "embedded")
+    check((out / emb["file"]).exists() and emb["width"] == "96",
+          "exported image file exists with correct dimensions")
+    check(records.get("G_images", {}).get("n_images") == str(len(g_imgs)),
+          "records.n_images links to images table")
+    con = sqlite3.connect(out / "test_records.db")
+    try:
+        n_db = con.execute('SELECT COUNT(*) FROM "records"').fetchone()[0]
+        n_rq = con.execute('SELECT COUNT(*) FROM "review_queue"').fetchone()[0]
+        n_im = con.execute('SELECT COUNT(*) FROM "images"').fetchone()[0]
+        joined = con.execute(
+            'SELECT COUNT(*) FROM "images" i JOIN "records" r '
+            'ON i."record_id" = r."record_id"').fetchone()[0]
+        fks = {t: [(r[2], r[3], r[4])
+                   for r in con.execute(f'PRAGMA foreign_key_list("{t}")')]
+               for t in ("images", "pdfs", "review_queue")}
+        idx = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+    finally:
+        con.close()
+    check(n_db == len(records), "SQLite records row count matches CSV")
+    check(n_im == len(imgs) and joined == len(imgs),
+          "SQLite images table populated and joinable to records")
+    check(all(fks[t] == [("records", "record_id", "record_id")]
+              for t in ("images", "pdfs", "review_queue")),
+          f"images/pdfs/review_queue declare a foreign key to records ({fks})")
+    check({"ix_images_record", "ix_pdfs_record", "ix_review_record",
+           "ix_records_status"} <= idx,
+          f"join and status indexes created ({sorted(idx)})")
+    rq_csv = read_csv(out / "review_queue.csv")
+    check(n_rq == len(rq_csv) and any(r["record_id"] == "D_short" for r in rq_csv),
+          "review queue consistent and contains D_short")
+
+    # record_unit=pdf: a loose image's own path implies a record id that does
+    # not exist in that mode, so ownership falls back to the PDFs beside it.
+    # The invariant: every image either joins to a real record or is reported.
+    pdf_schema_path = tmp / "schema_pdf.json"
+    pdf_schema = json.loads(json.dumps(SELFTEST_SCHEMA))
+    pdf_schema["record_unit"] = "pdf"
+    with open(pdf_schema_path, "w", encoding="utf-8") as fh:
+        json.dump(pdf_schema, fh)
+    cfg_pdf = dict(base_cfg)
+    cfg_pdf.update({"root": str(archive), "schema": str(pdf_schema_path),
+                    "out": str(tmp / "out_pdf"), "llm_base_url": "mock",
+                    "stages": "discover,extract,images,llm,load", "resume": False,
+                    "seed": 0, "image_min_bytes": 100})
+    run_pipeline(cfg_pdf)
+    p_out = tmp / "out_pdf"
+    p_ids = {r["record_id"] for r in read_csv(p_out / "records.csv")}
+    p_imgs = read_csv(p_out / "images.csv")
+    p_flagged = {i["rel_path"] for i in read_csv(p_out / "issues.csv")
+                 if i["reason"] == "image_owner_unresolved"}
+    silent = [i for i in p_imgs if i["source"] == "loose"
+              and i["record_id"] not in p_ids
+              and i["origin"] not in p_flagged]
+    check(not silent,
+          f"record_unit=pdf: no loose image is silently orphaned ({silent[:2]})")
+    check(all(i["record_id"] in p_ids for i in p_imgs if i["source"] == "embedded"),
+          "record_unit=pdf: embedded images still link to their PDF's record")
+
+    # determinism: run again into a fresh outdir; compare minus volatile columns
+    run_once(tmp / "out2")
+    r1 = read_csv(out / "records.csv")
+    r2 = read_csv(tmp / "out2" / "records.csv")
+    strip = lambda rows: [{k: v for k, v in r.items() if k != "extracted_at"} for r in rows]
+    check(strip(r1) == strip(r2), "two runs produce identical records (minus timestamps)")
+
+    # interrupted-run recovery: a torn final jsonl line must not break --resume
+    jl = out / "extractions.jsonl"
+    with open(jl, "a", encoding="utf-8") as fh:
+        fh.write('{"record_id": "torn", "status": "ok", "data"')  # kill -9 mid-write
+    cfg_resume = dict(cfg)
+    cfg_resume.update({"resume": True, "stages": "llm,load"})
+    run_pipeline(cfg_resume)
+    rec_r = {r["record_id"]: r for r in read_csv(out / "records.csv")}
+    check("torn" not in rec_r and rec_r.get("D_short", {}).get("status") == "needs_review",
+          "--resume survives a torn final jsonl line")
+    # running the llm stage again WITHOUT --resume must back up prior extractions
+    cfg_nores = dict(cfg)
+    cfg_nores.update({"resume": False, "stages": "llm,load"})
+    run_pipeline(cfg_nores)
+    check((out / "extractions.jsonl.bak").exists(),
+          "no-resume rerun backs up extractions.jsonl to .bak")
+    issues_after = read_csv(out / "issues.csv")
+    check(any(i["stage"] == "discover" for i in issues_after),
+          "discover-stage issues survive later llm,load-only invocations")
+
+    if failures:
+        die(f"selftest FAILED ({len(failures)}): " + "; ".join(failures))
+    log(f"selftest PASSED — artifacts kept in {tmp} for inspection")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Schema-driven PDF -> SQLite extraction pipeline "
+                                            "(air-gap safe; see module docstring).")
+    p.add_argument("--root", help="archive root directory")
+    p.add_argument("--schema", help="schema JSON file")
+    p.add_argument("--out", help="output directory")
+    p.add_argument("--llm-base-url", dest="llm_base_url",
+                   help='OpenAI-compatible base URL ending in /v1, or "mock"')
+    p.add_argument("--llm-model", dest="llm_model", help="model name at the endpoint")
+    p.add_argument("--stages", help="comma list from: discover,extract,llm,load")
+    p.add_argument("--resume", action="store_true", default=None,
+                   help="keep prior extractions.jsonl; skip records already ok")
+    p.add_argument("--limit", type=int, help="send at most N records to the LLM (smoke run)")
+    p.add_argument("--seed", type=int, help="seed for the audit-sample hash")
+    p.add_argument("--config", help="JSON file overriding CONFIG defaults")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="override any CONFIG key (repeatable), e.g. --set llm_timeout_s=300")
+    p.add_argument("--selftest", action="store_true",
+                   help="run the offline end-to-end selftest and exit")
+    return p.parse_args(argv)
+
+
+def build_cfg(args):
+    cfg = dict(CONFIG)
+    if args.config:
+        with open(args.config, encoding="utf-8") as fh:
+            overrides = json.load(fh)
+        bad = set(overrides) - set(cfg)
+        if bad:
+            die(f"--config has unknown keys: {sorted(bad)}")
+        cfg.update(overrides)
+    for kv in args.set:
+        if "=" not in kv:
+            die(f"--set expects KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        if k not in cfg:
+            die(f"--set: unknown CONFIG key {k!r}")
+        default = CONFIG[k]
+        if isinstance(default, bool):
+            cfg[k] = v.strip().lower() in ("1", "true", "yes")
+        elif isinstance(default, int):
+            cfg[k] = int(v)
+        elif isinstance(default, float):
+            cfg[k] = float(v)
+        else:
+            cfg[k] = v
+    for k in ("root", "schema", "out", "llm_base_url", "llm_model", "stages"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg[k] = v
+    if args.resume is not None:
+        cfg["resume"] = args.resume
+    if args.limit is not None:
+        cfg["limit"] = args.limit
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    return cfg
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    cfg = build_cfg(args)
+    if args.selftest:
+        selftest(cfg)
+        return
+    if not cfg["root"] or not cfg["schema"]:
+        die("--root and --schema are required (or use --selftest)")
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Corpus</title>
+<link rel="stylesheet" href="/static/app.css?v=APPVER">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+ <symbol id="i-corpus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5C4 5 6.9 3.8 10.5 3.8S17 5 17 6.5v11c0 1.5-2.9 2.7-6.5 2.7S4 19 4 17.5z"/><path d="M4 12c0 1.5 2.9 2.7 6.5 2.7S17 13.5 17 12"/><path d="M20 8v12"/></symbol>
+ <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+ <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.6 1.6 0 00-1-1.5 1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H3a2 2 0 110-4h.1a1.6 1.6 0 001.5-1 1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V3a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H21a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z"/></symbol>
+ <symbol id="i-dl" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11m0 0l-4.5-4.5M12 14l4.5-4.5M4 20h16"/></symbol>
+ <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l.8 12.5h9.4L17.5 7"/></symbol>
+ <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5 10-11"/></symbol>
+ <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+ <symbol id="i-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5L2.5 20h19zM12 10v4.5m0 2.8v.2"/></symbol>
+ <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8.2v.2"/></symbol>
+ <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l5 5"/></symbol>
+ <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 6.5A1.5 1.5 0 014.5 5h4L11 7.5h8.5A1.5 1.5 0 0121 9v9.5a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 18.5z"/></symbol>
+ <symbol id="i-save" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M5 4h11l4 4v12H5z"/><path d="M8.5 4v5h7V4M8.5 20v-6h7v6"/></symbol>
+ <symbol id="i-retry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 11-2.4-5.7M20 3.5V8h-4.5"/></symbol>
+ <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.4 5.4l1.7 1.7M16.9 16.9l1.7 1.7M18.6 5.4l-1.7 1.7M7.1 16.9l-1.7 1.7"/></symbol>
+ <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 14.2A8.5 8.5 0 019.8 4 8.5 8.5 0 1020 14.2z"/></symbol>
+ <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5.5L7.5 12l6.5 6.5"/></symbol>
+ <symbol id="i-fwd" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5.5l6.5 6.5-6.5 6.5"/></symbol>
+ <symbol id="i-key" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="14.5" r="4.5"/><path d="M11.8 11.2L20 3m-3.5 3.5L19 9"/></symbol>
+ <symbol id="i-draft" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.8L19 9.6l-5.1 1.8L12 16l-1.9-4.6L5 9.6l5.1-1.8z"/><path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></symbol>
+ <symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19.5 8.5a2.1 2.1 0 00-3-3L5 17z"/></symbol>
+ <symbol id="i-doc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M6 3h8l4.5 4.5V21H6z"/><path d="M14 3v5h4.5"/></symbol>
+ <symbol id="i-table" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="1.5"/><path d="M3.5 9.5h17M9.5 9.5v10"/></symbol>
+ <symbol id="i-server" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="6" rx="1.5"/><rect x="3.5" y="13.5" width="17" height="6" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+</defs></svg>
+
+<div class="shell">
+<nav class="rail" aria-label="Main">
+  <div class="mark"><svg width="21" height="21"><use href="#i-corpus"/></svg>
+    <span>Corpus</span><span class="ver" id="railver"></span></div>
+
+  <button class="navbtn" id="nav-corpora" onclick="go('#/corpora')" aria-current="page">
+    <svg width="17" height="17"><use href="#i-table"/></svg><span>Corpora</span>
+    <span class="tally" id="nav-tally"></span></button>
+  <button class="navbtn" id="nav-new" onclick="go('#/new')">
+    <svg width="17" height="17"><use href="#i-plus"/></svg><span>New corpus</span></button>
+  <button class="navbtn" id="nav-settings" onclick="go('#/settings')">
+    <svg width="17" height="17"><use href="#i-gear"/></svg><span>Settings</span></button>
+
+  <div class="railfoot">
+    <button class="endpoint" id="rail-endpoint" onclick="go('#/settings')"
+            title="Extraction endpoint — click to change">
+      <span class="lbl">Extraction model</span>
+      <span class="val" id="rail-endpoint-val">…</span>
+    </button>
+    <button class="ghostbtn" id="themebtn" onclick="toggleTheme()">
+      <svg width="14" height="14" id="themeicon"><use href="#i-moon"/></svg>
+      <span id="themelabel">Dark</span></button>
+  </div>
+</nav>
+
+<div class="plane">
+
+<!-- ================= CORPORA (ledger) ================= -->
+<section id="view-corpora">
+  <div class="topbar">
+    <div><h1>Corpora</h1>
+      <p class="sub" id="ledger-sub">Every database built from an archive of
+        documents.</p></div>
+    <div class="acts">
+      <button class="btn primary lg" onclick="go('#/new')">
+        <svg width="15" height="15"><use href="#i-plus"/></svg>New corpus</button>
+    </div>
+  </div>
+  <div class="content">
+    <div id="ledger-banner"></div>
+    <div class="panel">
+      <header>
+        <h2>All corpora <span class="hint num" id="ledger-count"></span></h2>
+        <div class="searchbox" style="width:250px">
+          <svg width="15" height="15"><use href="#i-search"/></svg>
+          <input type="search" id="ledger-q" placeholder="Filter by name or source"
+                 aria-label="Filter corpora" oninput="renderLedger()">
+        </div>
+      </header>
+      <div id="ledger-body"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CORPUS DETAIL ================= -->
+<section id="view-corpus" hidden>
+  <div class="topbar">
+    <div style="min-width:0">
+      <div class="crumb"><a href="#/corpora">Corpora</a>
+        <svg width="12" height="12"><use href="#i-fwd"/></svg>
+        <span id="c-crumb">…</span></div>
+      <h1 id="c-title">…</h1>
+      <p class="sub" id="c-sub"></p>
+    </div>
+    <div class="acts" id="c-acts"></div>
+  </div>
+
+  <div class="content">
+    <div id="c-alerts"></div>
+    <div class="panel"><div class="body">
+      <dl class="readout" id="c-readout"></dl>
+    </div></div>
+
+    <div class="panel">
+      <header style="gap:var(--s2)">
+        <div class="seg" id="c-tabs" role="tablist">
+          <button role="tab" data-tab="records" aria-pressed="true"
+                  onclick="pickTab('records')">Records</button>
+          <button role="tab" data-tab="review_queue" aria-pressed="false"
+                  onclick="pickTab('review_queue')">Review</button>
+          <button role="tab" data-tab="images" aria-pressed="false"
+                  onclick="pickTab('images')">Images</button>
+          <button role="tab" data-tab="pdfs" aria-pressed="false"
+                  onclick="pickTab('pdfs')">Documents</button>
+          <button role="tab" data-tab="issues" aria-pressed="false"
+                  onclick="pickTab('issues')">Issues</button>
+          <button role="tab" data-tab="overview" aria-pressed="false"
+                  onclick="pickTab('overview')">Overview</button>
+          <button role="tab" data-tab="export" aria-pressed="false"
+                  onclick="pickTab('export')">Export</button>
+        </div>
+        <div class="searchbox" id="c-searchbox" style="width:230px;margin-left:auto">
+          <svg width="15" height="15"><use href="#i-search"/></svg>
+          <input type="search" id="c-q" placeholder="Search every row"
+                 aria-label="Search rows" oninput="queryChanged()">
+        </div>
+      </header>
+      <div class="body" id="c-filters" hidden></div>
+      <div id="c-panelbody"></div>
+    </div>
+
+    <div class="panel" id="c-danger">
+      <div class="body" style="display:flex;align-items:center;gap:var(--s4);flex-wrap:wrap">
+        <div><b>Delete this corpus</b>
+          <p class="hint">Removes the stored PDFs, the database and every artifact
+            of this run. It cannot be undone.</p></div>
+        <button class="btn danger" style="margin-left:auto" onclick="deleteCorpus()">
+          <svg width="14" height="14"><use href="#i-trash"/></svg>Delete corpus</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= NEW CORPUS (intake) ================= -->
+<section id="view-new" hidden>
+  <div class="topbar">
+    <div><h1>New corpus</h1>
+      <p class="sub">Point at an archive of PDFs. Corpus reads the documents,
+        drafts a schema from them, and builds the database.</p></div>
+  </div>
+  <div class="content narrow">
+    <div class="steps">
+      <div class="step" id="step-1" data-state="on"><span class="no">1</span>Archive</div>
+      <div class="step" id="step-2"><span class="no">2</span>Schema</div>
+      <div class="step" id="step-3"><span class="no">3</span>Build</div>
+    </div>
+
+    <!-- step 1 -->
+    <div id="wiz-1">
+      <div class="panel">
+        <header><h2>Where are the documents?</h2>
+          <div class="seg">
+            <button id="src-upload" aria-pressed="true" onclick="setSource('upload')">
+              Upload a folder</button>
+            <button id="src-server" aria-pressed="false" onclick="setSource('server')">
+              Folder on this server</button>
+          </div>
+        </header>
+        <div class="body">
+          <div id="src-upload-block">
+            <button type="button" class="drop" id="dropzone" onclick="el('files').click()">
+              <svg width="30" height="30"><use href="#i-folder"/></svg>
+              <strong id="drop-title">Choose a folder of PDFs</strong>
+              <span class="hint" id="drop-note">Subfolders are included — or drop a
+                .zip of the whole archive here</span>
+            </button>
+            <input type="file" id="files" webkitdirectory multiple
+                   style="position:absolute;left:-9999px" aria-hidden="true" tabindex="-1">
+          </div>
+          <div id="src-server-block" hidden>
+            <div class="field">
+              <label for="spath">Absolute path on the server</label>
+              <input type="text" id="spath" spellcheck="false"
+                     placeholder="/data/archives/incident_reports">
+              <p class="hint">Read in place — nothing is uploaded or copied.</p>
+            </div>
+            <button class="btn" onclick="scanServerPath()">Scan this folder</button>
+          </div>
+          <div id="scan-msg" style="margin-top:var(--s3)"></div>
+        </div>
+      </div>
+      <div id="scan-result"></div>
+    </div>
+
+    <!-- step 2 -->
+    <div id="wiz-2" hidden>
+      <div id="draft-panel"></div>
+      <div class="panel">
+        <header>
+          <div><h2>Schema</h2>
+            <p class="sub">One row per record. Every field becomes a column.</p></div>
+          <div class="btnrow">
+            <button class="btn" onclick="openLibrary()">Saved schemas</button>
+            <button class="btn" onclick="saveSchema()">
+              <svg width="14" height="14"><use href="#i-save"/></svg>Save</button>
+          </div>
+        </header>
+        <div class="body">
+          <div class="grid2">
+            <div class="field"><label for="s-table">Table name</label>
+              <input type="text" id="s-table" value="records" spellcheck="false">
+              <p class="hint">Lowercase identifier. Becomes the SQL table name.</p></div>
+            <div class="field"><label for="s-unit">What is one record?</label>
+              <select id="s-unit" onchange="unitChanged()"></select>
+              <p class="hint" id="s-unit-hint"></p></div>
+          </div>
+          <div class="field"><label for="s-desc">What are these documents?</label>
+            <textarea id="s-desc" rows="2"
+              placeholder="e.g. Each record is one equipment failure investigation report."></textarea>
+            <p class="hint">Given to the extraction model as context for every record.</p></div>
+        </div>
+        <div class="body rowsep">
+          <div class="fieldhead"><span>Field</span><span>Type</span><span>Required</span>
+            <span>What to extract</span><span></span></div>
+          <div class="fields" id="s-fields"></div>
+          <div class="btnrow" style="margin-top:var(--s3)">
+            <button class="btn" onclick="addField()">
+              <svg width="14" height="14"><use href="#i-plus"/></svg>Add field</button>
+            <button class="btn" onclick="validateSchema(true)">Check schema</button>
+          </div>
+          <div id="s-msg" style="margin-top:var(--s3)"></div>
+        </div>
+      </div>
+      <div class="btnrow" style="margin-bottom:var(--s6)">
+        <button class="btn" onclick="wizGoto(1)">
+          <svg width="14" height="14"><use href="#i-back"/></svg>Back to archive</button>
+        <button class="btn primary lg" id="build-btn" onclick="startBuild()">
+          Build corpus</button>
+        <span class="hint" id="build-msg"></span>
+      </div>
+    </div>
+
+    <!-- step 3 -->
+    <div id="wiz-3" hidden>
+      <div class="panel">
+        <header><h2 id="build-title">Building</h2>
+          <span class="hint num" id="build-elapsed"></span></header>
+        <div class="body">
+          <div class="bar"><i id="build-bar" style="transform:scaleX(0)"></i></div>
+          <ul class="stagelist" id="build-stages">
+            <li data-s="discover"><span class="mark"><span class="dot"></span></span>Finding PDFs</li>
+            <li data-s="extract"><span class="mark"><span class="dot"></span></span>Reading text</li>
+            <li data-s="images"><span class="mark"><span class="dot"></span></span>Exporting images</li>
+            <li data-s="llm"><span class="mark"><span class="dot"></span></span>Extracting fields
+              <span class="hint num" id="build-llm"></span></li>
+            <li data-s="load"><span class="mark"><span class="dot"></span></span>Writing the database</li>
+          </ul>
+          <div id="build-result" style="margin-top:var(--s4)"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SETTINGS ================= -->
+<section id="view-settings" hidden>
+  <div class="topbar">
+    <div><h1>Settings</h1>
+      <p class="sub">Shared by everyone using this server.</p></div>
+  </div>
+  <div class="content narrow">
+    <div class="panel">
+      <header><div><h2>Extraction model</h2>
+        <p class="sub">An OpenAI-compatible endpoint on your network.</p></div></header>
+      <div class="body">
+        <div class="grid2">
+          <div class="field"><label for="set-url">Base URL</label>
+            <input type="text" id="set-url" spellcheck="false"
+                   placeholder="gateway.internal/v1">
+            <p class="hint">The full base URL of the OpenAI-compatible gateway,
+              scheme included, ending in <code>/v1</code>. Use <code>mock</code>
+              for offline test mode.</p></div>
+          <div class="field"><label for="set-model">Model name</label>
+            <input type="text" id="set-model" spellcheck="false"></div>
+        </div>
+        <div class="field"><label for="set-key">API key <span class="hint"
+              id="set-keyhint"></span></label>
+          <input type="password" id="set-key" autocomplete="off"
+                 placeholder="leave blank to keep the stored key">
+          <p class="hint">Stored server-side in <code>settings.json</code> with
+            owner-only permissions. Never shown again in full, never written to
+            logs or run summaries.</p></div>
+        <div class="btnrow">
+          <button class="btn primary" onclick="saveSettings()">
+            <svg width="14" height="14"><use href="#i-save"/></svg>Save settings</button>
+          <button class="btn" onclick="testSettings()">
+            <svg width="14" height="14"><use href="#i-key"/></svg>Test connection</button>
+          <button class="btn" onclick="clearKey()">Clear stored key</button>
+        </div>
+        <div id="set-msg" style="margin-top:var(--s4)"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header><h2>About this server</h2></header>
+      <div class="body"><dl class="filelist" id="about-list"></dl></div>
+    </div>
+  </div>
+</section>
+
+</div><!-- /plane -->
+</div><!-- /shell -->
+
+<div id="scrim" onclick="closeDrawer()"></div>
+<aside id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+  <header>
+    <h3 id="drawer-title">Record</h3>
+    <div class="btnrow" id="drawer-nav"></div>
+    <button class="iconbtn" id="drawer-close" onclick="closeDrawer()" aria-label="Close">
+      <svg width="16" height="16"><use href="#i-x"/></svg></button>
+  </header>
+  <div class="dbody" id="drawer-body"></div>
+  <div class="dfoot" id="drawer-foot" hidden></div>
+</aside>
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="tip" aria-hidden="true"></div>
+
+<script src="/static/app.js?v=APPVER"></script>
+<script src="/static/create.js?v=APPVER"></script>
+<script src="/static/database.js?v=APPVER"></script>
+<script src="/static/settings.js?v=APPVER"></script>
+</body>
+</html>

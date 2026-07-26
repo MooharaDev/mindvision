@@ -1,0 +1,17 @@
+# Environments / caches
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Local tool state
+.claude/settings.local.json
+.impeccable/
+
+# Runtime data — contains live API keys, job archives, and test report PDFs.
+# NEVER commit these: webapp_data/settings.json holds an LLM API key.
+webapp_data/
+test_out/
+reports/
+server.log
