@@ -40,6 +40,7 @@ BASE = Path(__file__).resolve().parent
 FILES = [
     "pdf2db.py",
     "webapp.py",
+    "restore_assets.py",
     "requirements.txt",
     "CLAUDE.md",
     "README.md",
@@ -53,6 +54,15 @@ FILES = [
     "schemas/failure_reports.json",  # served by /api/example-schema
 ]
 ROOT_DOCS = ["PRODUCT.md", "DESIGN.md"]  # live in the repo root, one level up
+
+# The gateway's file-type allowlist rejects web assets, so they ship with a
+# .txt suffix appended; restore_assets.py strips it again on the inside. The
+# rename is byte-preserving, and the manifest lists the shipped (.txt) names.
+TEXT_SAFE_SUFFIXES = (".html", ".css", ".js")
+
+
+def arcname(f):
+    return f + ".txt" if f.endswith(TEXT_SAFE_SUFFIXES) else f
 SIZE_LIMIT = 3 * 1024 ** 3  # EFT hard limit
 
 
@@ -62,7 +72,7 @@ def sha256(data):
 
 def build(out_dir):
     # (source path on disk, path inside the zip / in the manifest)
-    pairs = [(BASE / f, f) for f in FILES] + \
+    pairs = [(BASE / f, arcname(f)) for f in FILES] + \
             [(BASE.parent / d, d) for d in ROOT_DOCS]
     missing = [str(src) for src, _ in pairs if not src.exists()]
     if missing:

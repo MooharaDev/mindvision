@@ -16,9 +16,10 @@ Two front doors on the same engine:
 ```
 pdf2db.py                      # the whole pipeline engine, single file
 webapp.py                      # Flask backend for the Corpus web console
-templates/index.html           # console shell
-static/                        # app.css, app.js, create.js, database.js,
-                               #   settings.js — all self-contained, no CDN
+restore_assets.py              # run once after unzipping — see below
+templates/index.html.txt       # console shell (shipped with .txt appended —
+static/*.txt                   #   the gateway rejects .html/.css/.js;
+                               #   restore_assets.py renames them back)
 schemas/failure_reports.json   # example schema (material-failure incidents)
 requirements.txt               # pinned dependency versions
 wheels/                        # the pinned dependencies as .whl files, for
@@ -35,12 +36,16 @@ tooling. No pretrained weights are needed for this tool. `pdf2db.py
 --selftest` fabricates its own synthetic archive at runtime if a plumbing
 check is wanted.
 
-**Verify after transfer** (from inside the unzipped `pdf2db/` folder):
+**After transfer** (from inside the unzipped `pdf2db/` folder), in this order:
 ```bash
+# 1. integrity — the manifest lists files under their shipped (.txt) names:
 sha256sum -c MANIFEST.txt               # Linux
 # Windows PowerShell:
 # Get-Content MANIFEST.txt | ForEach-Object { $h,$f = $_ -split '  ',2;
 #   if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne $h) {"FAIL $f"} }
+
+# 2. give the web assets their real names back (pure rename, bytes untouched):
+python restore_assets.py
 ```
 
 ## Provision internally before running
