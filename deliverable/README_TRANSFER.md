@@ -16,17 +16,27 @@ Two front doors on the same engine:
 ```
 pdf2db.py                      # the whole pipeline engine, single file
 webapp.py                      # Flask backend for the Corpus web console
-webapp_selftest.py             # offline end-to-end test of the console
-make_eft_package.py            # builds/verifies the checksummed EFT zip
 templates/index.html           # console shell
 static/                        # app.css, app.js, create.js, database.js,
                                #   settings.js — all self-contained, no CDN
 schemas/failure_reports.json   # example schema (material-failure incidents)
-requirements.txt               # pinned; provision internally, no runtime pip
+requirements.txt               # pinned dependency versions
+wheels/                        # the pinned dependencies as .whl files, for
+                               #   fully offline install (see below)
 README_TRANSFER.md             # this file
+MANIFEST.sha256                # checksum per file — verify after transfer
 ```
-No pretrained weights are needed for this tool. No test data is included —
-`--selftest` fabricates its own synthetic archive at runtime.
+Runtime files only: no test data, no test harnesses, no build tooling.
+No pretrained weights are needed for this tool. `pdf2db.py --selftest`
+fabricates its own synthetic archive at runtime if a plumbing check is wanted.
+
+**Verify after transfer** (from inside the unzipped `pdf2db/` folder):
+```bash
+sha256sum -c MANIFEST.sha256               # Linux
+# Windows PowerShell:
+# Get-Content MANIFEST.sha256 | ForEach-Object { $h,$f = $_ -split '  ',2;
+#   if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne $h) {"FAIL $f"} }
+```
 
 ## Provision internally before running
 - Python 3.10+ (developed/tested on 3.13)
@@ -70,7 +80,6 @@ and no vision/multimodal LLM anywhere in the path.
 python pdf2db.py --selftest        # pipeline engine (43 checks; OCR checks are
                                    #   skipped with a clear note if tesseract
                                    #   is not installed — that is not a failure)
-python webapp_selftest.py          # web console end-to-end (76 checks)
 
 # 2. inventory + text extraction only (no LLM yet) — review text_report.csv
 #    to see how many reports are scanned (low_yield) before spending LLM calls:
@@ -213,11 +222,10 @@ without a restart. Keys are excluded from run summaries and logs.
 - Browser upload is comfortable for hundreds of PDFs (or one .zip); for big
   archives use server-path ingestion or run `pdf2db.py` directly.
 
-## Building the EFT package
-```bash
-python make_eft_package.py            # writes pdf2db_eft_v4.0_<date>.zip + SHA-256 manifest
-python make_eft_package.py --verify pdf2db_eft_v4.0_<date>.zip   # after transfer
-```
+## Building the EFT package (connected side only)
+`make_eft_package.py` in the source repo writes `pdf2db_eft_v<ver>_<date>.zip`
+with the SHA-256 manifest; it deliberately does not travel with the package.
+Inside the network, verify with `sha256sum -c MANIFEST.sha256` (see top).
 
 ## Writing a schema
 

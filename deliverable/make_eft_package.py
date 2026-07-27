@@ -30,13 +30,14 @@ from pathlib import Path
 
 VERSION = "4.3"
 BASE = Path(__file__).resolve().parent
+# Runtime files ONLY — nothing that could slow a transfer review. No test
+# harnesses (pdf2db.py --selftest is built into the engine itself), no dev
+# docs, no build tooling; integrity is checked on the far side with
+# sha256sum -c against the manifest, so this script does not ride along.
 FILES = [
     "pdf2db.py",
     "webapp.py",
-    "webapp_selftest.py",
-    "make_eft_package.py",
     "requirements.txt",
-    "README.md",
     "README_TRANSFER.md",
     "templates/index.html",
     "static/app.css",
@@ -44,7 +45,7 @@ FILES = [
     "static/create.js",
     "static/database.js",
     "static/settings.js",
-    "schemas/failure_reports.json",
+    "schemas/failure_reports.json",  # served by /api/example-schema
 ]
 SIZE_LIMIT = 3 * 1024 ** 3  # EFT hard limit
 
