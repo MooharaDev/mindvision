@@ -32,7 +32,17 @@ No pretrained weights are needed for this tool. No test data is included —
 - Python 3.10+ (developed/tested on 3.13)
 - `pymupdf==1.28.0` — the only dependency of the CLI pipeline
 - `flask==3.1.3` + `waitress==3.0.2` — only for the web console (`webapp.py`)
-Everything else is Python stdlib; request them via the internal PyPI channel.
+Everything else is Python stdlib.
+
+**The wheels ride along in `wheels/`** — no PyPI request needed. Install fully
+offline with:
+```
+python -m pip install --no-index --find-links wheels -r requirements.txt
+```
+Included platforms: Linux x86_64 (glibc 2.28+, i.e. RHEL 8+/Ubuntu 20.04+),
+Windows amd64, macOS arm64 — each for Python 3.10–3.13. If the server is
+something else (e.g. RHEL 7 or aarch64), request the packages through the
+internal PyPI channel instead; `requirements.txt` carries the exact pins.
 
 **OS package channel (NOT pip), only if scanned documents must be read:**
 - `tesseract-ocr` + the language data (`tesseract-ocr-eng`, add `-ara` etc.)

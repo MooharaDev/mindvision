@@ -15,3 +15,7 @@ webapp_data/
 test_out/
 reports/
 server.log
+
+# Dependency wheels — carried inside the EFT zip; refresh with the pip download
+# commands documented in deliverable/make_eft_package.py
+deliverable/wheels/

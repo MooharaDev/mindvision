@@ -11,6 +11,14 @@ Verify:  python make_eft_package.py --verify path/to/package.zip
          Recomputes every checksum inside the zip against its manifest.
 
 Never includes: webapp_data/, test outputs, virtualenvs, caches, or any data.
+
+Dependency wheels: every wheels/*.whl is packaged so the target can install
+fully offline (pip install --no-index --find-links wheels -r requirements.txt).
+Refresh them on the connected side with:
+    pip download -r requirements.txt -d wheels --only-binary=:all: \
+        --platform manylinux_2_28_x86_64 --python-version 310
+    (repeat for win_amd64 / macosx_11_0_arm64, and python-version 311-313
+     for markupsafe, which ships per-version wheels)
 """
 
 import argparse
@@ -50,19 +58,27 @@ def build(out_dir):
     if missing:
         print(f"FATAL: missing files: {missing}")
         return 1
+    wheels = sorted((BASE / "wheels").glob("*.whl"))
+    if not wheels:
+        print("FATAL: wheels/ is empty — the package must carry the pinned "
+              "dependencies so the target can install offline. See the "
+              "pip download commands at the top of this file.")
+        return 1
+    files = FILES + [f"wheels/{w.name}" for w in wheels]
     name = f"pdf2db_eft_v{VERSION}_{time.strftime('%Y%m%d')}.zip"
     out = Path(out_dir) / name
     manifest_lines = []
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in FILES:
+        for f in files:
             data = (BASE / f).read_bytes()
             z.writestr(f"pdf2db/{f}", data)
             manifest_lines.append(f"{sha256(data)}  {f}")
         z.writestr("pdf2db/MANIFEST.sha256", "\n".join(manifest_lines) + "\n")
     size = out.stat().st_size
     print(f"built  {out}")
-    print(f"       {len(FILES)} files, {size / 1024:.0f} KB "
-          f"({size / SIZE_LIMIT:.4%} of the 3 GB EFT limit)")
+    print(f"       {len(files)} files ({len(wheels)} wheels), "
+          f"{size / 1048576:.1f} MB "
+          f"({size / SIZE_LIMIT:.2%} of the 3 GB EFT limit)")
     print("verify after transfer with: "
           f"python make_eft_package.py --verify {name}")
     return 0
