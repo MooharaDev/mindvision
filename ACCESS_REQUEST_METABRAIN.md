@@ -65,6 +65,80 @@ Thank you,
 
 ---
 
+## 1a. Business-case details (the intake fields Metabrain asked for)
+
+Suggested answers below; every figure marked `[CONFIRM]` needs a real number
+from you or the MCS sponsor before this goes out. Keep the arithmetic in the
+submission — reviewers trust a visible formula over a bare claim.
+
+**Use case name**
+> Corpus — automated extraction of the Material Consulting Services (MCS)
+> material-failure incident archive into a queryable engineering database.
+
+**Task that the use case is providing**
+> Converting unstructured PDF failure-investigation reports (~50 years of MCS
+> incident records, no consistent template) into one structured database row
+> per incident — failure mechanism, equipment, location, dates, costs — each
+> value paired with the verbatim source sentence for human verification.
+> Low-confidence records are routed to a human review queue. The database
+> serves (a) day-to-day failure-history lookups by engineers, (b) failure-trend
+> analysis across decades, and (c) the labelled training set for the planned
+> phase-2 vision model on inspection imagery.
+
+**Deployment date**
+> The tool is already transferred through EFT and installed; the Metabrain key
+> is the last dependency. Deployment: within [2 weeks — CONFIRM] of key
+> issuance (smoke test of 10 documents on day 1, full archive backfill the
+> same week, console available to engineers immediately after).
+
+**Frequency of the task — before**
+> Failure-history inquiries are answered manually today: [15/month — CONFIRM
+> with MCS] archive searches, each meaning locating and reading the relevant
+> PDF reports by hand. Full-archive extraction (the backfill this key enables)
+> has effectively **never been performed** — at manual effort it is
+> [N_REPORTS] × ~30 min ≈ [X,000] engineer-hours, which is why the archive is
+> unqueryable today.
+
+**Frequency of the task — after**
+> The same [15/month] inquiries served from the database, plus newly issued
+> reports extracted on arrival ([~10/month — CONFIRM]). The one-time backfill
+> of [N_REPORTS — run `--stages discover` for the exact count] documents runs
+> as a single batch (~1 request per document).
+
+**Time spent on the task — before**
+> [2–4 hours — CONFIRM] per inquiry (find the right incident folders, read
+> several reports, transcribe values into a spreadsheet). Backfill equivalent:
+> ~30 min of engineer reading + transcription per report.
+
+**Time spent on the task — after**
+> [5–10 minutes] per inquiry (query the console or SQL, check the cited
+> evidence sentence against the source where it matters). Per new report:
+> ~seconds of pipeline time, plus ~3 min human review for the subset
+> (~15–20%) that lands in the review queue.
+
+**Estimated cost savings** (show the formula, plug confirmed numbers)
+> One-time backfill: [N_REPORTS] × 0.5 h avoided, minus review-queue time
+> ([N_REPORTS] × 18% × 3 min) and operator time (~[40 h]).
+> For example, at N = 10,000: 5,000 h avoided − ~90 h review − 40 h operator
+> ≈ **4,870 engineer-hours one-time**.
+> Recurring: [15 inquiries/month] × ([3 h] − [10 min]) ≈ **~42 engineer-hours
+> per month**, plus [10 new reports/month] × ~25 min ≈ 4 h/month.
+> Convert to SAR with the loaded engineer rate your finance contact prefers
+> [RATE — CONFIRM]; at SAR [300]/h the backfill alone is ≈ SAR [1.46M].
+
+**Expected number of users**
+> [25–50 — CONFIRM] total: 2–3 operators (MCS) who define schemas and run
+> extractions, 3–5 reviewers working the review queue, and the wider MCS /
+> reliability-engineering audience consuming the tables and downloads
+> read-only through the intranet console.
+
+Note the honest asymmetry that makes this case strong: the *API usage* is a
+short batch plus a trickle (Section 3), while the *value* accrues on every
+subsequent query that never touches Metabrain — the key funds a one-time
+conversion of 50 years of paper into an asset, not an ongoing per-query cost.
+
+---
+
 ## 2. What the tool is and how it calls the API
 
 `Corpus` — a self-contained Python tool (one pipeline engine plus an optional
