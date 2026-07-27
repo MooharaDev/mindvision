@@ -29,7 +29,7 @@ import time
 import zipfile
 from pathlib import Path
 
-VERSION = "4.3"
+VERSION = "4.4"
 BASE = Path(__file__).resolve().parent
 # Runtime files + context docs, nothing else. No test harnesses (pdf2db.py
 # --selftest is built into the engine itself) and no build tooling; integrity

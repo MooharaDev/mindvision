@@ -59,7 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pdf2db  # noqa: E402  (the pipeline engine, same directory)
 
 APP_NAME = "Corpus"
-APP_VERSION = "4.3"
+APP_VERSION = "4.4"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PDF2DB_WEB_DATA") or (Path.cwd() / "webapp_data"))
 JOBS_DIR = DATA_DIR / "jobs"
@@ -93,6 +93,11 @@ MAX_ZIP_MEMBERS = 20000
 MAX_ZIP_BYTES = 6 * 1024 ** 3
 DEFAULT_SETTINGS = {"llm_base_url": "mock", "llm_model": "internal-model",
                     "llm_api_key": "",
+                    # OAuth2 client-credentials (e.g. Metabrain/Keycloak).
+                    # When llm_auth_url is set, tokens are fetched from it and
+                    # auto-renewed; llm_api_key is then ignored.
+                    "llm_auth_url": "", "llm_client_id": "",
+                    "llm_client_secret": "",
                     # OCR is a property of the host (is the tesseract binary there?),
                     # so it lives in settings and every new corpus inherits it
                     "ocr_mode": "off", "ocr_language": "eng", "ocr_dpi": 300}
@@ -564,10 +569,8 @@ def _draft_schema(settings, samples, unit, n_records):
         schema["record_unit"] = unit
         return schema, {}, "generic", None
     cfg = dict(pdf2db.CONFIG)
-    cfg.update({"llm_base_url": settings["llm_base_url"],
-                "llm_model": settings["llm_model"],
-                "llm_api_key": settings["llm_api_key"],
-                "llm_timeout_s": 120, "llm_transport_retries": 2})
+    cfg.update(_llm_cfg(settings))
+    cfg.update({"llm_timeout_s": 120, "llm_transport_retries": 2})
     messages = [{"role": "system", "content": SUGGEST_SYSTEM},
                 {"role": "user",
                  "content": _suggest_user_prompt(samples, unit, n_records)}]
@@ -753,9 +756,11 @@ def api_get_settings():
 @app.put("/api/settings")
 def api_put_settings():
     body = request.get_json(force=True, silent=True) or {}
-    if any(k in body for k in ("llm_base_url", "llm_model", "llm_api_key")):
-        # deliberate: the endpoint and key must never be settable from the
-        # browser — the operator edits settings.json on the server directly
+    if any(k in body for k in ("llm_base_url", "llm_model", "llm_api_key",
+                               "llm_auth_url", "llm_client_id",
+                               "llm_client_secret")):
+        # deliberate: the endpoint and credentials must never be settable from
+        # the browser — the operator edits settings.json on the server directly
         return jsonify({"error": "the extraction endpoint is configured on the "
                                  "server only — edit webapp_data/settings.json "
                                  "(owner-only file); it cannot be set through "
@@ -1100,11 +1105,16 @@ def api_suggest_schema(sid):
 
 # ---- databases (jobs) ----
 def _llm_cfg(settings):
-    """LLM config for a run — stored server-side settings ONLY. A request must
-    never be able to point a run (and the stored key) at a caller-chosen URL;
-    the operator configures the endpoint in webapp_data/settings.json."""
-    return (settings["llm_base_url"].strip(), settings["llm_model"].strip(),
-            settings["llm_api_key"])
+    """LLM config overrides for a run — stored server-side settings ONLY. A
+    request must never be able to point a run (and the stored credentials) at
+    a caller-chosen URL; the operator configures webapp_data/settings.json.
+    Returned as a dict of pdf2db CONFIG keys, ready for cfg.update()."""
+    return {"llm_base_url": settings["llm_base_url"].strip(),
+            "llm_model": settings["llm_model"].strip(),
+            "llm_api_key": settings["llm_api_key"],
+            "llm_auth_url": (settings.get("llm_auth_url") or "").strip(),
+            "llm_client_id": (settings.get("llm_client_id") or "").strip(),
+            "llm_client_secret": settings.get("llm_client_secret") or ""}
 
 
 @app.post("/api/jobs")
@@ -1180,7 +1190,7 @@ def api_create_job():
     _write_meta(job_dir, meta)
 
     settings = _load_settings()
-    base_url, model, key = _llm_cfg(settings)
+    llm = _llm_cfg(settings)
     ingest, ing_errs = _ingest_cfg_from(request.form, settings)
     if ing_errs:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1190,17 +1200,18 @@ def api_create_job():
     _write_meta(job_dir, meta)
     cfg = dict(pdf2db.CONFIG)
     cfg.update(ingest)
+    cfg.update(llm)
     cfg.update({
         "root": str(root), "schema": str(schema_path), "out": str(out_dir),
-        "llm_base_url": base_url, "llm_model": model, "llm_api_key": key,
         "stages": "discover,extract,images,llm,load", "resume": False,
     })
 
     with JOBS_LOCK:
         JOBS[job_id] = _new_job_state(job_id, schema.get("table", "?"),
                                       meta["title"], meta.get("source", ""))
-        JOBS[job_id].update(n_files=n_saved, endpoint=base_url, model=model,
-                            is_mock=(base_url == "mock"))
+        JOBS[job_id].update(n_files=n_saved, endpoint=llm["llm_base_url"],
+                            model=llm["llm_model"],
+                            is_mock=(llm["llm_base_url"] == "mock"))
     threading.Thread(target=_run_job, args=(job_id, cfg), daemon=True).start()
     return jsonify({"job_id": job_id, "n_files": n_saved, "skipped": skipped})
 
@@ -1217,7 +1228,7 @@ def api_retry_job(job_id):
     root = _job_root(job_id)
     if not schema_path.exists() or not root.is_dir():
         return jsonify({"error": "database artifacts are missing on disk"}), 409
-    base_url, model, key = _llm_cfg(_load_settings())
+    llm = _llm_cfg(_load_settings())
     if (out_dir / "records_text.csv").exists():
         # backfill the images stage for databases created before it existed
         stages = "llm,load" if (out_dir / "images.csv").exists() \
@@ -1228,13 +1239,12 @@ def api_retry_job(job_id):
     # reuse the ingest options this corpus was built with, so a retry cannot
     # silently regroup or re-OCR the archive differently from the first pass
     cfg.update((_read_meta(job_dir) or {}).get("ingest") or {})
+    cfg.update(llm)
     cfg.update({"root": str(root), "schema": str(schema_path),
-                "out": str(out_dir), "llm_base_url": base_url,
-                "llm_model": model, "llm_api_key": key,
-                "stages": stages, "resume": True})
+                "out": str(out_dir), "stages": stages, "resume": True})
     _set(job_id, status="running", stage="queued", done=0, total=0, pct=0,
-         error=None, endpoint=base_url, model=model,
-         is_mock=(base_url == "mock"))
+         error=None, endpoint=llm["llm_base_url"], model=llm["llm_model"],
+         is_mock=(llm["llm_base_url"] == "mock"))
     threading.Thread(target=_run_job, args=(job_id, cfg), daemon=True).start()
     return jsonify({"ok": True, "stages": stages})
 

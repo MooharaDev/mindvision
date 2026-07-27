@@ -84,6 +84,37 @@ and no vision/multimodal LLM anywhere in the path.
 - No downloads, no telemetry, no runtime pip.
 - OCR, when enabled, is a local binary call. It adds no network surface.
 
+## Gateway authentication
+Two modes; pick per gateway:
+
+**Static API key** (default): `--set llm_api_key=...`, or better, the
+`PDF2DB_API_KEY` env var. Sent as `Authorization: Bearer`.
+
+**OAuth2 client-credentials** (Metabrain / Keycloak SSO): tokens expire
+(~3600 s, no refresh token), so the client fetches and renews them itself —
+cached per endpoint, renewed 120 s before expiry, one forced refresh on an
+unexpected 401. Long batch runs survive token expiry without intervention.
+```bash
+python pdf2db.py ... \
+  --set llm_auth_url=https://HOST/realms/metabrain-sso/protocol/openid-connect/token \
+  --set llm_client_id=YOUR_CLIENT_ID
+export PDF2DB_CLIENT_SECRET=...   # or --set llm_client_secret=... (discouraged)
+```
+For the web console, the same three keys go in `webapp_data/settings.json`:
+```json
+{
+  "llm_base_url": "https://GATEWAY-HOST/v1",
+  "llm_model": "MODELNAME",
+  "llm_auth_url": "https://HOST/realms/metabrain-sso/protocol/openid-connect/token",
+  "llm_client_id": "YOUR_CLIENT_ID",
+  "llm_client_secret": "YOUR_CLIENT_SECRET"
+}
+```
+When `llm_auth_url` is set, `llm_api_key` is ignored. A set `llm_auth_url`
+with a missing client id/secret fails validation at startup, before any work.
+The client secret is redacted from `run_summary.json` and all logs, exactly
+like the static key.
+
 ## First run inside (suggested order)
 ```bash
 # 1. prove the plumbing works on this machine, no data or network needed:

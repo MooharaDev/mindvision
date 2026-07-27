@@ -19,9 +19,12 @@ for the console.
   frozen unless that has been arranged.
 - The web UI is deliberately framework-free (vanilla JS in `static/`, one
   template). All assets are local; keep it that way.
-- `webapp_data/settings.json` holds the LLM API key (owner-only file). Never
-  print it, log it, or move it into code. The web API must never accept or
-  reveal endpoint/key values.
+- `webapp_data/settings.json` holds the gateway credentials (owner-only
+  file): either a static `llm_api_key`, or OAuth2 client-credentials
+  (`llm_auth_url` + `llm_client_id` + `llm_client_secret` — Metabrain/
+  Keycloak; tokens are fetched and auto-renewed by `pdf2db.call_openai_compat`).
+  Never print credentials, log them, or move them into code. The web API must
+  never accept or reveal endpoint/credential values.
 
 ## Layout
 - `pdf2db.py` — the whole engine; stages `discover,extract,images,llm,load`,

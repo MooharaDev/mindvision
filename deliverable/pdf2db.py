@@ -59,8 +59,10 @@ import re
 import ssl
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -124,6 +126,13 @@ CONFIG = {
     "llm_model": "internal-model",
     "llm_api_key": "",              # discouraged; prefer the env var below
     "llm_api_key_env": "PDF2DB_API_KEY",
+    # OAuth2 client-credentials (e.g. Metabrain via Keycloak SSO). When
+    # llm_auth_url is set, a bearer token is fetched from it and renewed
+    # automatically before expiry — llm_api_key is then ignored.
+    "llm_auth_url": "",             # token endpoint URL; "" = static key auth
+    "llm_client_id": "",
+    "llm_client_secret": "",        # discouraged; prefer the env var below
+    "llm_client_secret_env": "PDF2DB_CLIENT_SECRET",
     "llm_temperature": 0.0,
     "llm_force_json": False,        # send response_format={"type":"json_object"} (not all gateways support it)
     "llm_use_env_proxy": False,     # False = ignore http_proxy/HTTPS_PROXY env vars (air-gap default)
@@ -312,6 +321,15 @@ def validate_cfg(cfg, schema=None):
             f"Install the tesseract OS package inside the network, then either set "
             f"TESSDATA_PREFIX or point ocr_tessdata at the directory holding *.traineddata. "
             f"Set ocr_mode=off to run without OCR.")
+    if cfg.get("llm_auth_url") and cfg["llm_base_url"] != "mock":
+        if not cfg.get("llm_client_id"):
+            errs.append("llm_auth_url is set but llm_client_id is empty")
+        if not (cfg.get("llm_client_secret")
+                or os.environ.get(cfg.get("llm_client_secret_env") or "", "")):
+            errs.append("llm_auth_url is set but no client secret is available "
+                        f"(set llm_client_secret or the "
+                        f"{cfg.get('llm_client_secret_env') or 'PDF2DB_CLIENT_SECRET'} "
+                        f"env var)")
     return errs
 
 
@@ -1049,6 +1067,68 @@ def mock_llm_response(cfg, schema, record_id, text, attempt):
     return json.dumps(obj, ensure_ascii=False)
 
 
+def _llm_opener(cfg):
+    handlers = [] if cfg["llm_use_env_proxy"] else \
+        [urllib.request.ProxyHandler({})]  # ambient proxies must never re-route
+    if cfg.get("llm_ca_file"):  # HTTPS gateway signed by an internal/private CA
+        ctx = ssl.create_default_context(cafile=cfg["llm_ca_file"])
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(*handlers)
+
+
+# OAuth2 client-credentials token cache. Tokens from SSO gateways (Metabrain/
+# Keycloak) expire — typically after 3600 s with no refresh token — so long
+# batch runs must re-fetch. One cache per (endpoint, client), shared across
+# the llm worker threads and the web console's request threads.
+_TOKEN_LOCK = threading.Lock()
+_TOKEN_CACHE = {}  # (auth_url, client_id) -> (token, renew_after_epoch)
+
+
+def _oauth_token(cfg, opener, force=False):
+    """Bearer token via the client-credentials grant, renewed 120 s before
+    expiry so a token can never lapse mid-request. force=True drops the cached
+    token first (used once after an unexpected 401)."""
+    cache_key = (cfg["llm_auth_url"], cfg.get("llm_client_id", ""))
+    with _TOKEN_LOCK:
+        cached = None if force else _TOKEN_CACHE.get(cache_key)
+        if cached and time.time() < cached[1]:
+            return cached[0]
+        secret = os.environ.get(cfg.get("llm_client_secret_env") or "", "") \
+            or cfg.get("llm_client_secret", "")
+        form = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": cfg.get("llm_client_id", ""),
+            "client_secret": secret,
+        }).encode("ascii")
+        req = urllib.request.Request(
+            cfg["llm_auth_url"], data=form, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": "pdf2db/1.0"})
+        try:
+            with opener.open(req, timeout=cfg["llm_timeout_s"]) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read()[:300]
+            except OSError:
+                detail = b""
+            raise LLMTransportError(
+                f"token endpoint HTTP {e.code}: {detail!r} — check "
+                f"llm_client_id / client secret") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise LLMTransportError(f"token endpoint unreachable: {e}") from e
+        token = body.get("access_token")
+        if not token:
+            raise LLMTransportError("token endpoint returned no access_token "
+                                    f"(keys: {sorted(body)[:8]})")
+        try:
+            ttl = float(body.get("expires_in", 300))
+        except (TypeError, ValueError):
+            ttl = 300.0
+        _TOKEN_CACHE[cache_key] = (token, time.time() + max(30.0, ttl - 120.0))
+        return token
+
+
 def call_openai_compat(cfg, messages):
     url = cfg["llm_base_url"].rstrip("/") + "/chat/completions"
     payload = {"model": cfg["llm_model"], "messages": messages,
@@ -1058,16 +1138,16 @@ def call_openai_compat(cfg, messages):
     # explicit User-Agent: python-urllib's default gets blocked by bot filters
     # (e.g. Cloudflare error 1010) in front of some OpenAI-compatible providers
     headers = {"Content-Type": "application/json", "User-Agent": "pdf2db/1.0"}
-    key = os.environ.get(cfg["llm_api_key_env"] or "", "") or cfg["llm_api_key"]
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    handlers = [] if cfg["llm_use_env_proxy"] else \
-        [urllib.request.ProxyHandler({})]  # ambient proxies must never re-route
-    if cfg.get("llm_ca_file"):  # HTTPS gateway signed by an internal/private CA
-        ctx = ssl.create_default_context(cafile=cfg["llm_ca_file"])
-        handlers.append(urllib.request.HTTPSHandler(context=ctx))
-    opener = urllib.request.build_opener(*handlers)
+    opener = _llm_opener(cfg)
+    use_oauth = bool(cfg.get("llm_auth_url"))
+    if use_oauth:
+        headers["Authorization"] = "Bearer " + _oauth_token(cfg, opener)
+    else:
+        key = os.environ.get(cfg["llm_api_key_env"] or "", "") or cfg["llm_api_key"]
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
     last_err = "no attempt made"
+    refreshed_after_401 = False
     for i in range(cfg["llm_transport_retries"]):
         delay = cfg["llm_retry_backoff_s"] * (2 ** i)
         try:
@@ -1082,6 +1162,13 @@ def call_openai_compat(cfg, messages):
             except OSError:
                 detail = b""
             last_err = f"HTTP {e.code}: {detail!r}"
+            if e.code == 401 and use_oauth and not refreshed_after_401:
+                # token may have been revoked or expired early — one fresh
+                # token, then continue the normal retry budget
+                refreshed_after_401 = True
+                headers["Authorization"] = "Bearer " + \
+                    _oauth_token(cfg, opener, force=True)
+                continue
             if e.code in (400, 401, 403, 404, 422):
                 break  # config problem; retrying will not help
             if e.code == 429:  # rate limited — honor the server's Retry-After
@@ -1416,7 +1503,8 @@ def stage_load(cfg, schema, outdir, issues):
         "n_review_queue": len(review_rows),
         "n_issues": len(issues),
         "config": {k: v for k, v in cfg.items()
-                   if k != "llm_api_key" and not k.startswith("_")},
+                   if k not in ("llm_api_key", "llm_client_secret")
+                   and not k.startswith("_")},
     }
     with open(outdir / "run_summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
