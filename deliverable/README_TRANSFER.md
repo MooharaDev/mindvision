@@ -23,12 +23,17 @@ schemas/failure_reports.json   # example schema (material-failure incidents)
 requirements.txt               # pinned dependency versions
 wheels/                        # the pinned dependencies as .whl files, for
                                #   fully offline install (see below)
-README_TRANSFER.md             # this file
-MANIFEST.txt                # checksum per file — verify after transfer
+CLAUDE.md                      # project context for the internal Claude Code
+README.md                      # quick how-to-run
+README_TRANSFER.md             # this file (full reference)
+PRODUCT.md, DESIGN.md          # product intent + console design rules —
+                               #   context for AI-assisted maintenance inside
+MANIFEST.txt                   # checksum per file — verify after transfer
 ```
-Runtime files only: no test data, no test harnesses, no build tooling.
-No pretrained weights are needed for this tool. `pdf2db.py --selftest`
-fabricates its own synthetic archive at runtime if a plumbing check is wanted.
+Runtime files plus context docs: no test data, no test harnesses, no build
+tooling. No pretrained weights are needed for this tool. `pdf2db.py
+--selftest` fabricates its own synthetic archive at runtime if a plumbing
+check is wanted.
 
 **Verify after transfer** (from inside the unzipped `pdf2db/` folder):
 ```bash
@@ -49,10 +54,10 @@ offline with:
 ```
 python -m pip install --no-index --find-links wheels -r requirements.txt
 ```
-Included platforms: Linux x86_64 (glibc 2.28+, i.e. RHEL 8+/Ubuntu 20.04+),
-Windows amd64, macOS arm64 — each for Python 3.10–3.13. If the server is
-something else (e.g. RHEL 7 or aarch64), request the packages through the
-internal PyPI channel instead; `requirements.txt` carries the exact pins.
+Included platforms: Linux x86_64 (glibc 2.28+, i.e. RHEL 8+/Ubuntu 20.04+)
+and Windows amd64 — each for Python 3.10–3.13. If the server is something
+else (e.g. RHEL 7 or aarch64), request the packages through the internal
+PyPI channel instead; `requirements.txt` carries the exact pins.
 
 **OS package channel (NOT pip), only if scanned documents must be read:**
 - `tesseract-ocr` + the language data (`tesseract-ocr-eng`, add `-ara` etc.)

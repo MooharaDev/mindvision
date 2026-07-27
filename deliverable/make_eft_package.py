@@ -14,11 +14,12 @@ Never includes: webapp_data/, test outputs, virtualenvs, caches, or any data.
 
 Dependency wheels: every wheels/*.whl is packaged so the target can install
 fully offline (pip install --no-index --find-links wheels -r requirements.txt).
+Targets are Linux x86_64 and Windows amd64 only (no macOS in the network).
 Refresh them on the connected side with:
     pip download -r requirements.txt -d wheels --only-binary=:all: \
         --platform manylinux_2_28_x86_64 --python-version 310
-    (repeat for win_amd64 / macosx_11_0_arm64, and python-version 311-313
-     for markupsafe, which ships per-version wheels)
+    (repeat for win_amd64, and python-version 311-313 for markupsafe,
+     which ships per-version wheels)
 """
 
 import argparse
@@ -30,14 +31,18 @@ from pathlib import Path
 
 VERSION = "4.3"
 BASE = Path(__file__).resolve().parent
-# Runtime files ONLY — nothing that could slow a transfer review. No test
-# harnesses (pdf2db.py --selftest is built into the engine itself), no dev
-# docs, no build tooling; integrity is checked on the far side with
-# sha256sum -c against the manifest, so this script does not ride along.
+# Runtime files + context docs, nothing else. No test harnesses (pdf2db.py
+# --selftest is built into the engine itself) and no build tooling; integrity
+# is checked on the far side with sha256sum -c, so this script does not ride
+# along. The .md files travel deliberately: an internal Claude Code instance
+# uses CLAUDE.md/README*/PRODUCT/DESIGN as project context when maintaining
+# this code inside the network.
 FILES = [
     "pdf2db.py",
     "webapp.py",
     "requirements.txt",
+    "CLAUDE.md",
+    "README.md",
     "README_TRANSFER.md",
     "templates/index.html",
     "static/app.css",
@@ -47,6 +52,7 @@ FILES = [
     "static/settings.js",
     "schemas/failure_reports.json",  # served by /api/example-schema
 ]
+ROOT_DOCS = ["PRODUCT.md", "DESIGN.md"]  # live in the repo root, one level up
 SIZE_LIMIT = 3 * 1024 ** 3  # EFT hard limit
 
 
@@ -55,7 +61,10 @@ def sha256(data):
 
 
 def build(out_dir):
-    missing = [f for f in FILES if not (BASE / f).exists()]
+    # (source path on disk, path inside the zip / in the manifest)
+    pairs = [(BASE / f, f) for f in FILES] + \
+            [(BASE.parent / d, d) for d in ROOT_DOCS]
+    missing = [str(src) for src, _ in pairs if not src.exists()]
     if missing:
         print(f"FATAL: missing files: {missing}")
         return 1
@@ -65,21 +74,21 @@ def build(out_dir):
               "dependencies so the target can install offline. See the "
               "pip download commands at the top of this file.")
         return 1
-    files = FILES + [f"wheels/{w.name}" for w in wheels]
+    pairs += [(w, f"wheels/{w.name}") for w in wheels]
     name = f"pdf2db_eft_v{VERSION}_{time.strftime('%Y%m%d')}.zip"
     out = Path(out_dir) / name
     manifest_lines = []
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in files:
-            data = (BASE / f).read_bytes()
-            z.writestr(f"pdf2db/{f}", data)
-            manifest_lines.append(f"{sha256(data)}  {f}")
+        for src, arc in pairs:
+            data = src.read_bytes()
+            z.writestr(f"pdf2db/{arc}", data)
+            manifest_lines.append(f"{sha256(data)}  {arc}")
         # plain .txt so the transfer gateway's file-type allowlist accepts it;
         # sha256sum -c reads it regardless of the name
         z.writestr("pdf2db/MANIFEST.txt", "\n".join(manifest_lines) + "\n")
     size = out.stat().st_size
     print(f"built  {out}")
-    print(f"       {len(files)} files ({len(wheels)} wheels), "
+    print(f"       {len(pairs)} files ({len(wheels)} wheels), "
           f"{size / 1048576:.1f} MB "
           f"({size / SIZE_LIMIT:.2%} of the 3 GB EFT limit)")
     print("verify after transfer with: "
