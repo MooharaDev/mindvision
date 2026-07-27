@@ -24,7 +24,7 @@ requirements.txt               # pinned dependency versions
 wheels/                        # the pinned dependencies as .whl files, for
                                #   fully offline install (see below)
 README_TRANSFER.md             # this file
-MANIFEST.sha256                # checksum per file — verify after transfer
+MANIFEST.txt                # checksum per file — verify after transfer
 ```
 Runtime files only: no test data, no test harnesses, no build tooling.
 No pretrained weights are needed for this tool. `pdf2db.py --selftest`
@@ -32,9 +32,9 @@ fabricates its own synthetic archive at runtime if a plumbing check is wanted.
 
 **Verify after transfer** (from inside the unzipped `pdf2db/` folder):
 ```bash
-sha256sum -c MANIFEST.sha256               # Linux
+sha256sum -c MANIFEST.txt               # Linux
 # Windows PowerShell:
-# Get-Content MANIFEST.sha256 | ForEach-Object { $h,$f = $_ -split '  ',2;
+# Get-Content MANIFEST.txt | ForEach-Object { $h,$f = $_ -split '  ',2;
 #   if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne $h) {"FAIL $f"} }
 ```
 
@@ -225,7 +225,7 @@ without a restart. Keys are excluded from run summaries and logs.
 ## Building the EFT package (connected side only)
 `make_eft_package.py` in the source repo writes `pdf2db_eft_v<ver>_<date>.zip`
 with the SHA-256 manifest; it deliberately does not travel with the package.
-Inside the network, verify with `sha256sum -c MANIFEST.sha256` (see top).
+Inside the network, verify with `sha256sum -c MANIFEST.txt` (see top).
 
 ## Writing a schema
 

@@ -74,7 +74,9 @@ def build(out_dir):
             data = (BASE / f).read_bytes()
             z.writestr(f"pdf2db/{f}", data)
             manifest_lines.append(f"{sha256(data)}  {f}")
-        z.writestr("pdf2db/MANIFEST.sha256", "\n".join(manifest_lines) + "\n")
+        # plain .txt so the transfer gateway's file-type allowlist accepts it;
+        # sha256sum -c reads it regardless of the name
+        z.writestr("pdf2db/MANIFEST.txt", "\n".join(manifest_lines) + "\n")
     size = out.stat().st_size
     print(f"built  {out}")
     print(f"       {len(files)} files ({len(wheels)} wheels), "
@@ -92,7 +94,11 @@ def verify(zip_path):
         return 1
     bad = []
     with zipfile.ZipFile(p) as z:
-        manifest = z.read("pdf2db/MANIFEST.sha256").decode().strip().splitlines()
+        try:  # current name first; .sha256 kept readable for pre-v4.3 packages
+            raw = z.read("pdf2db/MANIFEST.txt")
+        except KeyError:
+            raw = z.read("pdf2db/MANIFEST.sha256")
+        manifest = raw.decode().strip().splitlines()
         for line in manifest:
             digest, fname = line.split(None, 1)
             fname = fname.strip()
